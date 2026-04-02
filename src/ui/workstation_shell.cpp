@@ -20,7 +20,7 @@ namespace ui {
 namespace {
 
 bool g_uiWantsMouseCapture = false;
-WorkstationShellState g_shellState = {};
+WorkstationShellState g_shellState = defaultWorkstationShellState();
 
 constexpr float kTopBarHeight = 72.0f;
 constexpr float kRailWidth = 86.0f;
@@ -322,15 +322,24 @@ void drawRadarPane(App& app, const Viewport& rootVp, const ImGuiViewport* mainVi
 void drawSingleRadarCanvas(App& app, const Viewport& vp, const ImGuiViewport* mainViewport,
                            const std::vector<StationUiState>& stations,
                            const std::vector<WarningPolygon>& warnings) {
+    const RadarPanelRect rect = app.radarPanelRect(0);
+    const Viewport paneVp = paneViewport(vp, rect);
+    const ImVec2 origin(mainViewport->Pos.x + (float)rect.x,
+                        mainViewport->Pos.y + (float)rect.y);
     auto* drawList = ImGui::GetBackgroundDrawList();
-    app.basemap().drawBase(drawList, vp, mainViewport->Pos);
+    drawList->PushClipRect(origin,
+                           ImVec2(origin.x + rect.width, origin.y + rect.height),
+                           true);
+    app.basemap().drawBase(drawList, paneVp, origin);
     drawList->AddImage((ImTextureID)(uintptr_t)app.outputTexture().textureId(),
-                       mainViewport->Pos,
-                       ImVec2(mainViewport->Pos.x + mainViewport->Size.x,
-                              mainViewport->Pos.y + mainViewport->Size.y));
-    app.basemap().drawOverlay(drawList, vp, mainViewport->Pos);
-    drawStationMarkers(app, vp, mainViewport->Pos, stations, app.activeStation());
-    drawWarningPolygons(app, vp, mainViewport->Pos, warnings);
+                       origin,
+                       ImVec2(origin.x + rect.width, origin.y + rect.height));
+    app.basemap().drawOverlay(drawList, paneVp, origin);
+    drawStationMarkers(app, paneVp, origin, stations, app.activeStation());
+    drawWarningPolygons(app, paneVp, origin, warnings);
+    drawList->AddRect(origin, ImVec2(origin.x + rect.width, origin.y + rect.height),
+                      IM_COL32(34, 42, 55, 200));
+    drawList->PopClipRect();
 }
 
 void syncWorkspaceFromApp(App& app) {
@@ -360,3 +369,383 @@ void applyWorkspace(App& app, WorkspaceId workspace) {
     if (workspace == WorkspaceId::Live && app.radarPanelCount() > 1)
         app.setRadarPanelLayout(RadarPanelLayout::Single);
 }
+
+void drawTopBar(App& app, const std::vector<WarningPolygon>& warnings) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->Pos);
+    ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, kTopBarHeight));
+    ImGui::Begin("##cursdar3_topbar", nullptr,
+                 ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::TextColored(ImVec4(0.92f, 0.96f, 1.0f, 1.0f), "CURSDAR3");
+    ImGui::SameLine(110.0f);
+    for (WorkspaceId workspace : {WorkspaceId::Live, WorkspaceId::Compare, WorkspaceId::Archive, WorkspaceId::Warning, WorkspaceId::Volume}) {
+        const bool selected = (g_shellState.workspace == workspace);
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.30f, 0.42f, 1.0f));
+        if (ImGui::Button(workspaceLabel(workspace)))
+            applyWorkspace(app, workspace);
+        if (selected) ImGui::PopStyleColor();
+        ImGui::SameLine();
+    }
+
+    ImGui::SameLine(0.0f, 18.0f);
+    const int activeIdx = app.activeStation();
+    const auto stationStates = app.stations();
+    const std::string siteLabel = activeIdx >= 0 ? stationStates[activeIdx].icao : "---";
+    ImGui::Text("Site %s", siteLabel.c_str());
+    ImGui::SameLine();
+    if (ImGui::Button(app.autoTrackStation() ? "Nearest" : "Locked"))
+        app.setAutoTrackStation(!app.autoTrackStation());
+    ImGui::SameLine();
+    ImGui::Text("Alerts %d", (int)warnings.size());
+
+    ImGui::Separator();
+
+    for (int i = 0; i < (int)Product::COUNT; ++i) {
+        const bool selected = (app.activeProduct() == i);
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.42f, 0.34f, 1.0f));
+        if (ImGui::Button(PRODUCT_INFO[i].code))
+            app.setProduct(i);
+        if (selected) ImGui::PopStyleColor();
+        ImGui::SameLine();
+    }
+
+    ImGui::SameLine(0.0f, 18.0f);
+    for (int t = 0; t < app.maxTilts(); ++t) {
+        char label[16];
+        std::snprintf(label, sizeof(label), "T%d", t + 1);
+        const bool selected = (app.activeTilt() == t);
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.26f, 0.18f, 1.0f));
+        if (ImGui::Button(label))
+            app.setTilt(t);
+        if (selected) ImGui::PopStyleColor();
+        if (t + 1 < app.maxTilts()) ImGui::SameLine();
+    }
+
+    ImGui::SameLine(0.0f, 18.0f);
+    if (ImGui::Button("1-Up")) app.setRadarPanelLayout(RadarPanelLayout::Single);
+    ImGui::SameLine();
+    if (ImGui::Button("2-Up")) app.setRadarPanelLayout(RadarPanelLayout::Dual);
+    ImGui::SameLine();
+    if (ImGui::Button("4-Up")) app.setRadarPanelLayout(RadarPanelLayout::Quad);
+
+    ImGui::SameLine(0.0f, 18.0f);
+    ImGui::Checkbox("Geo", &g_shellState.links.geo); ImGui::SameLine();
+    ImGui::Checkbox("Time", &g_shellState.links.time); ImGui::SameLine();
+    ImGui::Checkbox("Station", &g_shellState.links.station); ImGui::SameLine();
+    ImGui::Checkbox("Tilt", &g_shellState.links.tilt);
+
+    ImGui::End();
+}
+
+void drawWorkspaceRail(App& app) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float railY = viewport->Pos.y + kTopBarHeight;
+    const float railH = viewport->Size.y - kTopBarHeight - kTimeDeckHeight;
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x, railY));
+    ImGui::SetNextWindowSize(ImVec2(kRailWidth, railH));
+    ImGui::Begin("##cursdar3_rail", nullptr,
+                 ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings);
+
+    for (WorkspaceId workspace : {WorkspaceId::Live, WorkspaceId::Compare, WorkspaceId::Archive, WorkspaceId::Warning, WorkspaceId::Volume, WorkspaceId::Tools, WorkspaceId::Assets}) {
+        const bool selected = (g_shellState.workspace == workspace);
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.30f, 0.42f, 1.0f));
+        if (ImGui::Button(workspaceLabel(workspace), ImVec2(-1.0f, 32.0f)))
+            applyWorkspace(app, workspace);
+        if (selected) ImGui::PopStyleColor();
+    }
+
+    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 90.0f);
+    if (ImGui::Button(g_shellState.contextDockOpen ? "Hide Dock" : "Show Dock", ImVec2(-1.0f, 28.0f)))
+        g_shellState.contextDockOpen = !g_shellState.contextDockOpen;
+    if (ImGui::Button("Home", ImVec2(-1.0f, 28.0f)))
+        resetConusView(app);
+    ImGui::End();
+}
+
+void drawInspectTab(App& app, const std::vector<StationUiState>& stations, const MemoryTelemetry& mem) {
+    ImGui::Text("Cursor");
+    ImGui::Separator();
+    ImGui::Text("Lat %.4f", app.cursorLat());
+    ImGui::Text("Lon %.4f", app.cursorLon());
+    ImGui::Separator();
+    ImGui::Text("Workspace: %s", workspaceLabel(g_shellState.workspace));
+    ImGui::Text("Mode: %s", app.mode3D() ? "3D" : (app.crossSection() ? "Cross Section" :
+                           (app.m_historicMode ? "Archive" : (app.snapshotMode() ? "Snapshot" : "Live"))));
+    ImGui::Text("Product: %s", PRODUCT_INFO[app.activeProduct()].name);
+    ImGui::Text("Threshold: %.1f", app.dbzMinThreshold());
+    ImGui::Separator();
+    const int activeIdx = app.activeStation();
+    if (activeIdx >= 0 && activeIdx < (int)stations.size()) {
+        const auto& st = stations[activeIdx];
+        ImGui::Text("%s  %s, %s",
+                    st.icao.c_str(),
+                    NEXRAD_STATIONS[activeIdx].name,
+                    NEXRAD_STATIONS[activeIdx].state);
+        if (!st.latest_scan_utc.empty())
+            ImGui::Text("Scan: %s", st.latest_scan_utc.c_str());
+        ImGui::Text("TDS %d  Hail %d  Meso %d",
+                    (int)st.detection.tds.size(),
+                    (int)st.detection.hail.size(),
+                    (int)st.detection.meso.size());
+        ImGui::Text("Ingest %.1f build %.1f detect %.1f upload %.1f ms",
+                    st.timings.decode_ms,
+                    st.timings.sweep_build_ms,
+                    st.timings.detection_ms,
+                    st.timings.upload_ms);
+    }
+    ImGui::Separator();
+    ImGui::Text("VRAM: %s / %s",
+                formatBytes(mem.gpu_used_bytes).c_str(),
+                formatBytes(mem.gpu_total_bytes).c_str());
+    ImGui::Text("RAM: %s", formatBytes(mem.process_working_set_bytes).c_str());
+    ImGui::Text("Profile: %s", performanceProfileLabel(app.effectivePerformanceProfile()));
+}
+
+void drawAlertsTab(App& app, const std::vector<WarningPolygon>& warnings) {
+    ImGui::Checkbox("Overlays", &app.m_warningOptions.enabled);
+    ImGui::SameLine();
+    ImGui::Checkbox("Warnings", &app.m_warningOptions.showWarnings);
+    ImGui::SameLine();
+    ImGui::Checkbox("Watches", &app.m_warningOptions.showWatches);
+    ImGui::SameLine();
+    ImGui::Checkbox("Statements", &app.m_warningOptions.showStatements);
+    ImGui::Separator();
+    if (warnings.empty()) {
+        ImGui::TextDisabled("No alert polygons loaded.");
+        return;
+    }
+    for (size_t i = 0; i < warnings.size(); ++i) {
+        const auto& warning = warnings[i];
+        ImGui::PushStyleColor(ImGuiCol_Text, rgbaToImVec4(warning.color));
+        std::string label = warning.event + "##alert_" + std::to_string(i);
+        if (ImGui::Selectable(label.c_str(), false))
+            centerOnWarning(app, warning);
+        ImGui::PopStyleColor();
+        if (!warning.headline.empty())
+            ImGui::TextWrapped("%s", warning.headline.c_str());
+        if (!warning.office.empty())
+            ImGui::TextDisabled("%s | %s", warning.office.c_str(),
+                                warning.historic ? "Historic" : "Live");
+        ImGui::Spacing();
+    }
+}
+
+void drawLayersTab(App& app) {
+    ImGui::Text("Radar Layers");
+    ImGui::Separator();
+    ImGui::Checkbox("Warnings", &app.m_warningOptions.enabled);
+    ImGui::Checkbox("Polygon Fills", &app.m_warningOptions.fillPolygons);
+    ImGui::Checkbox("Polygon Outlines", &app.m_warningOptions.outlinePolygons);
+    ImGui::Checkbox("TDS", &app.m_showTDS);
+    ImGui::Checkbox("Hail", &app.m_showHail);
+    ImGui::Checkbox("Meso", &app.m_showMeso);
+    ImGui::Separator();
+    ImGui::TextDisabled("Basemap, styling, and placefile layering will consolidate here.");
+}
+
+void drawAssetsTab(App& app) {
+    ImGui::Text("Asset Manager");
+    ImGui::Separator();
+    ImGui::TextWrapped("Palettes, polling links, archive downloads, and feed configuration belong here in Cursdar3.");
+    ImGui::Spacing();
+    if (ImGui::Button("Archive Workspace", ImVec2(-1.0f, 28.0f)))
+        applyWorkspace(app, WorkspaceId::Archive);
+    if (ImGui::Button("Warning Workspace", ImVec2(-1.0f, 28.0f)))
+        applyWorkspace(app, WorkspaceId::Warning);
+}
+
+void drawSessionTab() {
+    ImGui::Text("Saved Workspaces");
+    ImGui::Separator();
+    ImGui::BulletText("Solo Live");
+    ImGui::BulletText("Dual Linked");
+    ImGui::BulletText("Tornado Interrogate");
+    ImGui::BulletText("Hail Interrogate");
+    ImGui::BulletText("Archive Review");
+    ImGui::BulletText("3D Inspect");
+    ImGui::BulletText("Cross Section");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Workspace persistence is planned as a first-class Cursdar3 feature.");
+}
+
+void drawContextDock(App& app, const std::vector<StationUiState>& stations,
+                     const std::vector<WarningPolygon>& warnings) {
+    if (!g_shellState.contextDockOpen) return;
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float dockX = viewport->Pos.x + viewport->Size.x - kDockWidth;
+    const float dockY = viewport->Pos.y + kTopBarHeight;
+    const float dockH = viewport->Size.y - kTopBarHeight - kTimeDeckHeight;
+    ImGui::SetNextWindowPos(ImVec2(dockX, dockY));
+    ImGui::SetNextWindowSize(ImVec2(kDockWidth, dockH));
+    ImGui::Begin("##cursdar3_dock", nullptr,
+                 ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings);
+
+    if (ImGui::BeginTabBar("##dock_tabs")) {
+        const MemoryTelemetry& mem = app.memoryTelemetry();
+        if (ImGui::BeginTabItem(dockTabLabel(ContextDockTab::Inspect))) {
+            g_shellState.dockTab = ContextDockTab::Inspect;
+            drawInspectTab(app, stations, mem);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(dockTabLabel(ContextDockTab::Alerts))) {
+            g_shellState.dockTab = ContextDockTab::Alerts;
+            drawAlertsTab(app, warnings);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(dockTabLabel(ContextDockTab::Layers))) {
+            g_shellState.dockTab = ContextDockTab::Layers;
+            drawLayersTab(app);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(dockTabLabel(ContextDockTab::Assets))) {
+            g_shellState.dockTab = ContextDockTab::Assets;
+            drawAssetsTab(app);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(dockTabLabel(ContextDockTab::Session))) {
+            g_shellState.dockTab = ContextDockTab::Session;
+            drawSessionTab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+}
+
+void drawTimeDeck(App& app) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x, viewport->Pos.y + viewport->Size.y - kTimeDeckHeight));
+    ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, kTimeDeckHeight));
+    ImGui::Begin("##cursdar3_timedeck", nullptr,
+                 ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings);
+
+    if (ImGui::Button("Live Tail")) g_shellState.timeMode = TimeDeckMode::LiveTail;
+    ImGui::SameLine();
+    if (ImGui::Button("Review")) g_shellState.timeMode = TimeDeckMode::Review;
+    ImGui::SameLine();
+    if (ImGui::Button("Archive")) g_shellState.timeMode = TimeDeckMode::Archive;
+    ImGui::SameLine();
+    if (ImGui::Button("Snapshot")) g_shellState.timeMode = TimeDeckMode::Snapshot;
+
+    ImGui::Separator();
+
+    if (app.m_historicMode) {
+        auto& hist = app.m_historic;
+        if (ImGui::Button(hist.playing() ? "Pause" : "Play")) hist.togglePlay();
+        ImGui::SameLine();
+        if (ImGui::Button("Back to Live")) app.refreshData();
+        ImGui::SameLine();
+        ImGui::Text("%s", hist.currentLabel().empty() ? "Archive Review" : hist.currentLabel().c_str());
+        if (hist.numFrames() > 0) {
+            int frame = hist.currentFrame();
+            if (ImGui::SliderInt("##archive_frame", &frame, 0, hist.numFrames() - 1))
+                hist.setFrame(frame);
+        } else {
+            ImGui::TextDisabled("No archive frames loaded.");
+        }
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::Button(app.liveLoopPlaying() ? "Pause" : "Play", ImVec2(62, 24)))
+        app.toggleLiveLoopPlayback();
+    ImGui::SameLine();
+    if (ImGui::Button("Live", ImVec2(56, 24)))
+        app.setLiveLoopPlaybackFrame(std::max(0, app.liveLoopAvailableFrames() - 1));
+    ImGui::SameLine();
+    if (ImGui::Button(app.liveLoopEnabled() ? "Loop On" : "Loop Off", ImVec2(76, 24)))
+        app.setLiveLoopEnabled(!app.liveLoopEnabled());
+    ImGui::SameLine();
+    int loopFrames = app.liveLoopLength();
+    if (ImGui::SliderInt("Frames", &loopFrames, 1, app.liveLoopMaxFrames(), "%d", ImGuiSliderFlags_AlwaysClamp))
+        app.setLiveLoopLength(loopFrames);
+    ImGui::SameLine();
+    float loopSpeed = app.liveLoopSpeed();
+    if (ImGui::SliderFloat("FPS", &loopSpeed, 1.0f, 15.0f, "%.0f"))
+        app.setLiveLoopSpeed(loopSpeed);
+
+    if (app.liveLoopEnabled())
+        drawLiveLoopTimeline(app, "##cursdar3_timeline", 28.0f);
+    else
+        ImGui::TextDisabled("Loop disabled. Time is global in Cursdar3; enable loop or jump into archive review.");
+
+    if (app.liveLoopEnabled()) {
+        ImGui::Text("Frames %d/%d   Downloads %d/%d   Render Queue %d",
+                    app.liveLoopAvailableFrames(),
+                    app.liveLoopLength(),
+                    app.liveLoopBackfillFetchCompleted(),
+                    app.liveLoopBackfillFetchTotal(),
+                    app.liveLoopBackfillPendingFrames());
+    }
+
+    ImGui::End();
+}
+
+} // namespace
+
+void init() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 4.0f;
+    style.FrameRounding = 3.0f;
+    style.GrabRounding = 3.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FramePadding = ImVec2(8, 6);
+    style.ItemSpacing = ImVec2(8, 6);
+    style.WindowPadding = ImVec2(12, 10);
+
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.045f, 0.050f, 0.060f, 0.96f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.07f, 0.085f, 1.0f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.09f, 0.11f, 0.14f, 1.0f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.09f, 0.11f, 0.14f, 1.0f);
+    colors[ImGuiCol_Button] = ImVec4(0.11f, 0.14f, 0.18f, 1.0f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.16f, 0.22f, 0.29f, 1.0f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.19f, 0.28f, 0.36f, 1.0f);
+    colors[ImGuiCol_Tab] = ImVec4(0.10f, 0.11f, 0.14f, 1.0f);
+    colors[ImGuiCol_TabSelected] = ImVec4(0.17f, 0.24f, 0.32f, 1.0f);
+}
+
+void render(App& app) {
+    g_uiWantsMouseCapture = false;
+    syncWorkspaceFromApp(app);
+
+    const auto stations = app.stations();
+    const auto warnings = app.currentWarnings();
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+
+    const WorkstationRegionRects rects = computeWorkstationShellRects(
+        (int)viewport->Size.x, (int)viewport->Size.y, g_shellState.contextDockOpen);
+    app.setRadarCanvasRect(rects.canvas_x, rects.canvas_y, rects.canvas_w, rects.canvas_h);
+
+    const bool multiPanel = app.radarPanelCount() > 1;
+    if (multiPanel) {
+        for (int pane = 0; pane < app.radarPanelCount(); ++pane)
+            drawRadarPane(app, app.viewport(), viewport, stations, warnings, pane);
+    } else {
+        drawSingleRadarCanvas(app, app.viewport(), viewport, stations, warnings);
+    }
+
+    drawTopBar(app, warnings);
+    drawWorkspaceRail(app);
+    drawContextDock(app, stations, warnings);
+    drawTimeDeck(app);
+}
+
+void shutdown() {
+}
+
+bool wantsMouseCapture() {
+    return g_uiWantsMouseCapture;
+}
+
+} // namespace ui

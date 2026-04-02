@@ -14,6 +14,26 @@ The radar owns the screen. Time is global. Everything else appears only when nee
 
 This repo currently starts from the proven `cursdar2` engine stack while the new shell, workspace model, and interrogation workflows are rebuilt in-place.
 
+## Current Status
+
+Implemented now:
+
+- standalone `cursdar3` build target and executable
+- new five-region workstation shell baseline
+- top command bar for hot-path product / tilt / layout controls
+- left workspace rail for Live / Compare / Archive / Warning / Volume navigation
+- right context dock with Inspect / Alerts / Layers / Assets / Session tabs
+- unified bottom time deck for live loop and archive transport
+- inherited CUDA radar engine from `cursdar2` while the shell is rebuilt
+
+Not finished yet:
+
+- full workspace-state rewrite inside the engine layer
+- warning-triggered interrogation workspaces
+- true pane-linking model for geo / time / station / tilt
+- saved workspaces and command palette
+- deeper asset manager flows replacing the old panel-era controls
+
 ## Highlights
 
 - Live Level 2 ingest from AWS NEXRAD plus selected IEM-hosted experimental/testbed feeds

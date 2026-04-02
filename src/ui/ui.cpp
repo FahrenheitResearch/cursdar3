@@ -2,6 +2,7 @@
 #include "workstation.h"
 #include "app.h"
 #include "nexrad/products.h"
+#include "nexrad/stations.h"
 #include "net/warnings.h"
 
 #include <imgui.h>
@@ -11,12 +12,81 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace ui {
 namespace {
 
 bool g_uiWantsMouseCapture = false;
+
+WarningPolygon const* findSelectedWarning(const ConsoleSession& session,
+                                          const std::vector<WarningPolygon>& warnings) {
+    if (session.alertFocus.selectedAlertId.empty())
+        return nullptr;
+    for (const auto& warning : warnings) {
+        if (warning.id == session.alertFocus.selectedAlertId)
+            return &warning;
+    }
+    return nullptr;
+}
+
+const char* warningGroupLabel(WarningGroup group) {
+    switch (group) {
+        case WarningGroup::Tornado: return "Tornado";
+        case WarningGroup::Severe: return "Severe";
+        case WarningGroup::Fire: return "Fire";
+        case WarningGroup::Flood: return "Flood";
+        case WarningGroup::Marine: return "Marine";
+        case WarningGroup::Watch: return "Watch";
+        case WarningGroup::Statement: return "Statement";
+        case WarningGroup::Advisory: return "Advisory";
+        case WarningGroup::Other: return "Other";
+    }
+    return "Other";
+}
+
+bool pointInWarning(float lat, float lon, const WarningPolygon& warning) {
+    const size_t count = std::min(warning.lats.size(), warning.lons.size());
+    if (count < 3)
+        return false;
+
+    bool inside = false;
+    for (size_t i = 0, j = count - 1; i < count; j = i++) {
+        const float yi = warning.lats[i];
+        const float xi = warning.lons[i];
+        const float yj = warning.lats[j];
+        const float xj = warning.lons[j];
+        const bool intersects = ((yi > lat) != (yj > lat)) &&
+            (lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-6f) + xi);
+        if (intersects)
+            inside = !inside;
+    }
+    return inside;
+}
+
+void centerOnWarning(App& app, const WarningPolygon& warning) {
+    if (warning.lats.empty() || warning.lons.empty())
+        return;
+    double latSum = 0.0;
+    double lonSum = 0.0;
+    const size_t count = std::min(warning.lats.size(), warning.lons.size());
+    for (size_t i = 0; i < count; ++i) {
+        latSum += warning.lats[i];
+        lonSum += warning.lons[i];
+    }
+    app.viewport().center_lat = latSum / (double)count;
+    app.viewport().center_lon = lonSum / (double)count;
+    app.viewport().zoom = std::max(app.viewport().zoom, 85.0);
+}
+
+std::string stationLabelFromId(const std::vector<StationUiState>& stations, int stationId) {
+    for (const auto& station : stations) {
+        if (station.index == stationId)
+            return station.icao;
+    }
+    return "---";
+}
 
 struct ShellRegions {
     ImRect topBar;
@@ -110,11 +180,11 @@ std::string formatBytes(size_t bytes) {
     return buffer;
 }
 
-void drawTimeline(App& app, const char* id, float height = 28.0f) {
-    const int targetFrames = std::max(1, app.liveLoopLength());
-    const int available = std::max(0, app.liveLoopAvailableFrames());
+void drawTimeline(App& app, ConsoleSession& session, const char* id, float height = 28.0f) {
+    const int targetFrames = std::max(1, session.transport.requestedFrames);
+    const int available = std::max(0, session.transport.readyFrames);
     const int loadedStart = std::max(0, targetFrames - available);
-    const int playback = std::clamp(app.liveLoopPlaybackFrame(), 0, std::max(0, available - 1));
+    const int playback = std::clamp(session.transport.cursorFrame, 0, std::max(0, available - 1));
     const int currentSlot = available > 0 ? std::clamp(loadedStart + playback, 0, targetFrames - 1) : targetFrames - 1;
 
     const float width = std::max(260.0f, ImGui::GetContentRegionAvail().x);
@@ -143,13 +213,43 @@ void drawTimeline(App& app, const char* id, float height = 28.0f) {
         const int slot = std::clamp((int)std::floor(normalized * targetFrames), 0, targetFrames - 1);
         const int frameIndex = slot < loadedStart ? 0 : std::clamp(slot - loadedStart, 0, available - 1);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            app.setLiveLoopPlaybackFrame(frameIndex);
+            transportSeekFrame(app, session, frameIndex);
         }
         g_uiWantsMouseCapture = true;
     }
 }
 
-void drawCanvas(App& app, const ShellRegions& regions, const ImGuiViewport* mainViewport) {
+void drawPaneHeader(App& app, const ConsoleSession& session,
+                    const std::vector<StationUiState>& stations,
+                    ImDrawList* draw, const ImVec2& min, int paneIndex,
+                    int product, int tilt, bool activePane) {
+    const PaneState& pane = session.panes[paneIndex];
+    char header[160];
+    std::snprintf(header, sizeof(header), "%s | %s | %s | T%d",
+                  paneRoleLabel(pane.role),
+                  stationLabelFromId(stations, pane.selection.stationId).c_str(),
+                  PRODUCT_INFO[product].name,
+                  pane.selection.tilt.sweepIndex + 1);
+
+    const ImVec2 textSize = ImGui::CalcTextSize(header);
+    const ImVec2 badgeTl(min.x + 10.0f, min.y + 10.0f);
+    const ImVec2 badgeBr(badgeTl.x + textSize.x + 16.0f, badgeTl.y + 34.0f);
+    draw->AddRectFilled(badgeTl, badgeBr, IM_COL32(8, 12, 18, 210), 4.0f);
+    draw->AddRect(badgeTl, badgeBr,
+                  activePane ? IM_COL32(100, 210, 255, 220) : IM_COL32(60, 78, 110, 180),
+                  4.0f);
+    draw->AddText(ImVec2(badgeTl.x + 8.0f, badgeTl.y + 9.0f), IM_COL32(230, 236, 244, 240), header);
+
+    char links[64];
+    std::snprintf(links, sizeof(links), "G%d T%d S%d L%d",
+                  pane.links.geo, pane.links.time, pane.links.station, pane.links.tilt);
+    draw->AddText(ImVec2(badgeTl.x + 8.0f, badgeTl.y + 38.0f), IM_COL32(132, 145, 165, 220), links);
+}
+
+void drawCanvas(App& app, ConsoleSession& session, const ShellRegions& regions,
+                const ImGuiViewport* mainViewport,
+                const std::vector<StationUiState>& stations,
+                const std::vector<WarningPolygon>& warnings) {
     const ImRect rect = regions.centerCanvas;
     app.setRadarCanvasRect((int)(rect.Min.x - mainViewport->Pos.x),
                            (int)(rect.Min.y - mainViewport->Pos.y),
@@ -175,12 +275,9 @@ void drawCanvas(App& app, const ShellRegions& regions, const ImGuiViewport* main
             draw->AddImage((ImTextureID)(uintptr_t)app.panelTexture(pane).textureId(), min, max);
             app.basemap().drawOverlay(draw, paneVp, min);
             draw->AddRect(min, max, IM_COL32(35, 42, 56, 180), 0.0f, 0, 1.0f);
-            char label[96];
-            std::snprintf(label, sizeof(label), "%s | T%d", PRODUCT_INFO[app.radarPanelProduct(pane)].name, app.activeTilt() + 1);
-            draw->AddRectFilled(ImVec2(min.x + 10.0f, min.y + 10.0f),
-                                ImVec2(min.x + 10.0f + ImGui::CalcTextSize(label).x + 16.0f, min.y + 34.0f),
-                                IM_COL32(8, 12, 18, 210), 4.0f);
-            draw->AddText(ImVec2(min.x + 18.0f, min.y + 15.0f), IM_COL32(230, 236, 244, 240), label);
+            drawPaneHeader(app, session, stations, draw, min, pane,
+                           app.radarPanelProduct(pane), app.radarPanelTilt(pane),
+                           session.activePaneIndex == pane);
             draw->PopClipRect();
         }
     } else {
@@ -189,12 +286,19 @@ void drawCanvas(App& app, const ShellRegions& regions, const ImGuiViewport* main
         draw->AddImage((ImTextureID)(uintptr_t)app.outputTexture().textureId(), rect.Min, rect.Max);
         app.basemap().drawOverlay(draw, root, rect.Min);
         draw->AddRect(rect.Min, rect.Max, IM_COL32(35, 42, 56, 180), 0.0f, 0, 1.0f);
-        char label[96];
-        std::snprintf(label, sizeof(label), "%s | T%d", PRODUCT_INFO[app.activeProduct()].name, app.activeTilt() + 1);
-        draw->AddRectFilled(ImVec2(rect.Min.x + 10.0f, rect.Min.y + 10.0f),
-                            ImVec2(rect.Min.x + 10.0f + ImGui::CalcTextSize(label).x + 16.0f, rect.Min.y + 34.0f),
-                            IM_COL32(8, 12, 18, 210), 4.0f);
-        draw->AddText(ImVec2(rect.Min.x + 18.0f, rect.Min.y + 15.0f), IM_COL32(230, 236, 244, 240), label);
+        drawPaneHeader(app, session, stations, draw, rect.Min, 0,
+                       app.activeProduct(), app.activeTilt(), true);
+
+        const WarningPolygon* selectedWarning = findSelectedWarning(session, warnings);
+        if (selectedWarning) {
+            const char* label = selectedWarning->event.c_str();
+            const ImVec2 textSize = ImGui::CalcTextSize(label);
+            const ImVec2 tl(rect.Min.x + 10.0f, rect.Min.y + 62.0f);
+            const ImVec2 br(tl.x + textSize.x + 16.0f, tl.y + 24.0f);
+            draw->AddRectFilled(tl, br, IM_COL32(44, 16, 16, 210), 4.0f);
+            draw->AddRect(tl, br, IM_COL32(196, 78, 78, 220), 4.0f);
+            draw->AddText(ImVec2(tl.x + 8.0f, tl.y + 4.0f), IM_COL32(255, 220, 220, 240), label);
+        }
         draw->PopClipRect();
     }
 
@@ -208,7 +312,7 @@ void drawCanvas(App& app, const ShellRegions& regions, const ImGuiViewport* main
     }
 }
 
-void renderTopBar(App& app, WorkstationState& state, const ShellRegions& regions,
+void renderTopBar(App& app, ConsoleSession& session, const ShellRegions& regions,
                   const std::vector<StationUiState>& stations,
                   const std::vector<WarningPolygon>& warnings) {
     beginFixedWindow("##c3_top_bar", regions.topBar);
@@ -217,11 +321,11 @@ void renderTopBar(App& app, WorkstationState& state, const ShellRegions& regions
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
-    ImGui::Text("%s", workspaceLabel(state.activeWorkspace));
+    ImGui::Text("%s", workspaceLabel(session.activeWorkspace));
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
-    ImGui::Text("Site %s", app.activeStationName().c_str());
+    ImGui::Text("Site %s", stationLabelFromId(stations, session.stationWorkflow.focusedStationId).c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
@@ -233,34 +337,61 @@ void renderTopBar(App& app, WorkstationState& state, const ShellRegions& regions
 
     ImGui::Separator();
 
-    if (ImGui::Button(app.autoTrackStation() ? "Auto" : "Locked"))
-        app.setAutoTrackStation(!app.autoTrackStation());
+    if (ImGui::Button(session.stationWorkflow.followNearest ? "Scout" : "Locked")) {
+        session.stationWorkflow.followNearest = !session.stationWorkflow.followNearest;
+        if (session.stationWorkflow.followNearest) {
+            session.stationWorkflow.lockedStationId = -1;
+            app.setAutoTrackStation(true);
+        } else if (session.stationWorkflow.focusedStationId >= 0) {
+            session.stationWorkflow.lockedStationId = session.stationWorkflow.focusedStationId;
+            app.setAutoTrackStation(false);
+        }
+    }
     ImGui::SameLine();
-    if (ImGui::Button(app.liveLoopPlaying() ? "Pause" : "Play"))
-        app.toggleLiveLoopPlayback();
+    ImGui::SetNextItemWidth(110.0f);
+    if (ImGui::InputTextWithHint("##site_search", "Site", session.stationWorkflow.searchQuery, IM_ARRAYSIZE(session.stationWorkflow.searchQuery),
+                                 ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_EnterReturnsTrue)) {
+        for (const auto& station : stations) {
+            if (_stricmp(station.icao.c_str(), session.stationWorkflow.searchQuery) == 0) {
+                session.stationWorkflow.followNearest = false;
+                session.stationWorkflow.lockedStationId = station.index;
+                app.setAutoTrackStation(false);
+                focusStation(app, session, station.index, true, -1.0);
+                break;
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(session.transport.playIntent ? "Pause" : "Play")) {
+        toggleTransportPlay(app, session);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Live"))
-        app.setLiveLoopPlaybackFrame(std::max(0, app.liveLoopAvailableFrames() - 1));
+        transportJumpLive(app, session);
     ImGui::SameLine();
     if (ImGui::Button("Refresh"))
         app.refreshData();
     ImGui::SameLine();
-    if (ImGui::Button(app.mode3D() ? "Exit 3D" : "3D"))
+    if (ImGui::Button(app.mode3D() ? "Exit 3D" : "3D")) {
         app.toggle3D();
+        session.activeWorkspace = app.mode3D() ? WorkspaceId::Volume : WorkspaceId::Live;
+    }
     ImGui::SameLine();
-    if (ImGui::Button(app.crossSection() ? "Hide XS" : "Cross Section"))
+    if (ImGui::Button(app.crossSection() ? "Hide XS" : "Cross Section")) {
         app.toggleCrossSection();
+        session.activeWorkspace = app.crossSection() ? WorkspaceId::Volume : WorkspaceId::Live;
+    }
 
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
 
     for (int product = 0; product < (int)Product::COUNT; ++product) {
-        if (product == app.activeProduct())
+        if (product == session.panes[session.activePaneIndex].selection.product)
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
         if (ImGui::Button(PRODUCT_INFO[product].code))
-            app.setProduct(product);
-        if (product == app.activeProduct())
+            setPaneProduct(app, session, session.activePaneIndex, product);
+        if (product == session.panes[session.activePaneIndex].selection.product)
             ImGui::PopStyleColor();
         if (product != (int)Product::COUNT - 1)
             ImGui::SameLine();
@@ -272,11 +403,11 @@ void renderTopBar(App& app, WorkstationState& state, const ShellRegions& regions
     for (int tilt = 0; tilt < app.maxTilts(); ++tilt) {
         char label[8];
         std::snprintf(label, sizeof(label), "T%d", tilt + 1);
-        if (tilt == app.activeTilt())
+        if (tilt == session.panes[session.activePaneIndex].selection.tilt.sweepIndex)
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.30f, 0.22f, 1.0f));
         if (ImGui::Button(label))
-            app.setTilt(tilt);
-        if (tilt == app.activeTilt())
+            setPaneTilt(app, session, session.activePaneIndex, tilt);
+        if (tilt == session.panes[session.activePaneIndex].selection.tilt.sweepIndex)
             ImGui::PopStyleColor();
         if (tilt != app.maxTilts() - 1)
             ImGui::SameLine();
@@ -290,26 +421,39 @@ void renderTopBar(App& app, WorkstationState& state, const ShellRegions& regions
     const char* layoutLabels[] = {"Single", "Dual", "Quad"};
     ImGui::SetNextItemWidth(96.0f);
     if (ImGui::Combo("##layout_combo", &layoutIdx, layoutLabels, IM_ARRAYSIZE(layoutLabels))) {
-        app.setRadarPanelLayout(layoutIdx == 0 ? RadarPanelLayout::Single :
-                                layoutIdx == 1 ? RadarPanelLayout::Dual :
-                                                 RadarPanelLayout::Quad);
-        state.activeWorkspace = layoutIdx == 0 ? WorkspaceId::Live : WorkspaceId::Compare;
+        if (layoutIdx == 0) {
+            setWorkspace(app, session, WorkspaceId::Live);
+        } else if (layoutIdx == 1) {
+            setWorkspace(app, session, WorkspaceId::Compare);
+        } else {
+            session.activeWorkspace = (session.activeWorkspace == WorkspaceId::Warning)
+                ? WorkspaceId::Warning
+                : WorkspaceId::Compare;
+            app.setRadarPanelLayout(RadarPanelLayout::Quad);
+        }
     }
 
     ImGui::SameLine();
-    ImGui::Checkbox("Geo", &state.paneLinks[0].geo);
+    bool geoLinked = session.panes[session.activePaneIndex].links.geo == session.panes[0].links.geo;
+    if (ImGui::Checkbox("Geo", &geoLinked))
+        session.panes[session.activePaneIndex].links.geo = geoLinked ? session.panes[0].links.geo : session.activePaneIndex + 1;
     ImGui::SameLine();
-    ImGui::Checkbox("Time", &state.paneLinks[0].time);
+    bool timeLinked = session.panes[session.activePaneIndex].links.time == session.panes[0].links.time;
+    if (ImGui::Checkbox("Time", &timeLinked))
+        session.panes[session.activePaneIndex].links.time = timeLinked ? session.panes[0].links.time : session.activePaneIndex + 1;
     ImGui::SameLine();
-    ImGui::Checkbox("Station", &state.paneLinks[0].station);
+    bool stationLinked = session.panes[session.activePaneIndex].links.station == session.panes[0].links.station;
+    if (ImGui::Checkbox("Station", &stationLinked))
+        session.panes[session.activePaneIndex].links.station = stationLinked ? session.panes[0].links.station : session.activePaneIndex + 1;
     ImGui::SameLine();
-    ImGui::Checkbox("Tilt", &state.paneLinks[0].tilt);
+    bool tiltLinked = session.panes[session.activePaneIndex].links.tilt == session.panes[0].links.tilt;
+    if (ImGui::Checkbox("Tilt", &tiltLinked))
+        session.panes[session.activePaneIndex].links.tilt = tiltLinked ? session.panes[0].links.tilt : session.activePaneIndex + 1;
 
-    (void)stations;
     endFixedWindow();
 }
 
-void renderRail(App& app, WorkstationState& state, const ShellRegions& regions) {
+void renderRail(App& app, ConsoleSession& session, const ShellRegions& regions) {
     beginFixedWindow("##c3_workspace_rail", regions.leftRail);
     const std::array<WorkspaceId, 7> items = {
         WorkspaceId::Live, WorkspaceId::Compare, WorkspaceId::Archive, WorkspaceId::Warning,
@@ -317,14 +461,10 @@ void renderRail(App& app, WorkstationState& state, const ShellRegions& regions) 
     };
 
     for (WorkspaceId id : items) {
-        const bool active = (id == state.activeWorkspace);
+        const bool active = (id == session.activeWorkspace);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.34f, 0.48f, 1.0f));
         if (ImGui::Button(workspaceLabel(id), ImVec2(-1.0f, 34.0f))) {
-            state.activeWorkspace = id;
-            if (id == WorkspaceId::Live) app.setRadarPanelLayout(RadarPanelLayout::Single);
-            if (id == WorkspaceId::Compare && app.radarPanelLayout() == RadarPanelLayout::Single)
-                app.setRadarPanelLayout(RadarPanelLayout::Dual);
-            if (id == WorkspaceId::Warning) app.setRadarPanelLayout(RadarPanelLayout::Quad);
+            setWorkspace(app, session, id);
         }
         if (active) ImGui::PopStyleColor();
     }
@@ -338,33 +478,38 @@ void renderRail(App& app, WorkstationState& state, const ShellRegions& regions) 
     endFixedWindow();
 }
 
-void renderDock(App& app, WorkstationState& state, const ShellRegions& regions,
+void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
                 const std::vector<StationUiState>& stations,
                 const std::vector<WarningPolygon>& warnings) {
-    if (!state.contextDockOpen)
+    if (!session.contextDockOpen)
         return;
 
     beginFixedWindow("##c3_context_dock", regions.rightDock);
     if (ImGui::BeginTabBar("##dock_tabs")) {
         if (ImGui::BeginTabItem("Inspect")) {
-            state.activeDockTab = ContextDockTab::Inspect;
-            ImGui::Text("Active Station: %s", app.activeStationName().c_str());
-            ImGui::Text("Product: %s", PRODUCT_INFO[app.activeProduct()].name);
-            ImGui::Text("Tilt: %.1f", app.activeTiltAngle());
+            session.activeDockTab = ContextDockTab::Inspect;
+            const PaneState& pane = session.panes[session.activePaneIndex];
+            ImGui::Text("Focused Station: %s", stationLabelFromId(stations, session.stationWorkflow.focusedStationId).c_str());
+            ImGui::Text("Hover Station: %s", stationLabelFromId(stations, session.stationWorkflow.hoveredStationId).c_str());
+            ImGui::Text("Locked Station: %s", stationLabelFromId(stations, session.stationWorkflow.lockedStationId).c_str());
+            ImGui::Separator();
+            ImGui::Text("Pane %d | %s", session.activePaneIndex + 1, paneRoleLabel(pane.role));
+            ImGui::Text("Product: %s", PRODUCT_INFO[pane.selection.product].name);
+            ImGui::Text("Tilt: %.1f", pane.selection.tilt.elevationDeg);
             ImGui::Text("Loaded: %d / %d", app.stationsLoaded(), app.stationsTotal());
             const auto& mem = app.memoryTelemetry();
             ImGui::Separator();
             ImGui::Text("VRAM %s / %s", formatBytes(mem.gpu_used_bytes).c_str(), formatBytes(mem.gpu_total_bytes).c_str());
             ImGui::Text("RAM %s", formatBytes(mem.process_working_set_bytes).c_str());
-            if (app.activeStation() >= 0 && app.activeStation() < (int)stations.size()) {
-                const auto& st = stations[app.activeStation()];
+            if (session.stationWorkflow.focusedStationId >= 0 && session.stationWorkflow.focusedStationId < (int)stations.size()) {
+                const auto& st = stations[session.stationWorkflow.focusedStationId];
                 if (!st.latest_scan_utc.empty())
                     ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
             }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Alerts")) {
-            state.activeDockTab = ContextDockTab::Alerts;
+            session.activeDockTab = ContextDockTab::Alerts;
             ImGui::Checkbox("Overlays", &app.m_warningOptions.enabled);
             ImGui::Checkbox("Warnings", &app.m_warningOptions.showWarnings);
             ImGui::SameLine();
@@ -376,14 +521,44 @@ void renderDock(App& app, WorkstationState& state, const ShellRegions& regions,
                 ImGui::TextDisabled("No alert polygons loaded.");
             } else {
                 for (size_t i = 0; i < warnings.size(); ++i) {
-                    ImGui::TextWrapped("%s", warnings[i].headline.c_str());
+                    const bool selected = warnings[i].id == session.alertFocus.selectedAlertId;
+                    if (ImGui::Selectable((warnings[i].event + "##alert_" + std::to_string(i)).c_str(), selected)) {
+                        selectAlert(app, session, warnings, stations, warnings[i].id);
+                        centerOnWarning(app, warnings[i]);
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", warningGroupLabel(warnings[i].group));
+                    if (!warnings[i].headline.empty())
+                        ImGui::TextWrapped("%s", warnings[i].headline.c_str());
+                    if (selected) {
+                        if (ImGui::Button("Focus")) {
+                            centerOnWarning(app, warnings[i]);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Interrogate Tornado")) {
+                            activateTornadoInterrogate(app, session, warnings, stations);
+                        }
+                        if (!session.alertFocus.candidateStations.empty()) {
+                            ImGui::SeparatorText("Candidate Stations");
+                            for (int stationId : session.alertFocus.candidateStations) {
+                                if (ImGui::Button(stationLabelFromId(stations, stationId).c_str(), ImVec2(88.0f, 0.0f))) {
+                                    session.stationWorkflow.followNearest = false;
+                                    session.stationWorkflow.lockedStationId = stationId;
+                                    app.setAutoTrackStation(false);
+                                    focusStation(app, session, stationId, true, 120.0);
+                                }
+                                ImGui::SameLine();
+                            }
+                            ImGui::NewLine();
+                        }
+                    }
                     ImGui::Separator();
                 }
             }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Layers")) {
-            state.activeDockTab = ContextDockTab::Layers;
+            session.activeDockTab = ContextDockTab::Layers;
             int basemapIdx = (int)app.basemap().style();
             const char* basemapLabels[] = {"Relief", "Ops Dark", "Satellite", "Satellite Hybrid"};
             if (ImGui::Combo("Basemap", &basemapIdx, basemapLabels, IM_ARRAYSIZE(basemapLabels)))
@@ -406,7 +581,7 @@ void renderDock(App& app, WorkstationState& state, const ShellRegions& regions,
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Assets")) {
-            state.activeDockTab = ContextDockTab::Assets;
+            session.activeDockTab = ContextDockTab::Assets;
             int profileIdx = (int)app.requestedPerformanceProfile();
             const char* profileLabels[] = {"Auto", "Quality", "Balanced", "Performance"};
             if (ImGui::Combo("Profile", &profileIdx, profileLabels, IM_ARRAYSIZE(profileLabels)))
@@ -419,14 +594,17 @@ void renderDock(App& app, WorkstationState& state, const ShellRegions& regions,
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Session")) {
-            state.activeDockTab = ContextDockTab::Session;
-            ImGui::BulletText("Solo Live");
-            ImGui::BulletText("Dual Linked");
-            ImGui::BulletText("Tornado Interrogate");
-            ImGui::BulletText("Hail Interrogate");
-            ImGui::BulletText("Archive Review");
-            ImGui::BulletText("3D Inspect");
-            ImGui::BulletText("Cross Section");
+            session.activeDockTab = ContextDockTab::Session;
+            if (ImGui::Button("Solo Live", ImVec2(-1.0f, 28.0f))) {
+                setWorkspace(app, session, WorkspaceId::Live);
+            }
+            if (ImGui::Button("Dual Linked", ImVec2(-1.0f, 28.0f))) {
+                setWorkspace(app, session, WorkspaceId::Compare);
+            }
+            if (ImGui::Button("Tornado Interrogate", ImVec2(-1.0f, 28.0f))) {
+                activateTornadoInterrogate(app, session, warnings, stations);
+            }
+            ImGui::TextDisabled("Workspaces are now shell state, not just panel toggles.");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -434,52 +612,54 @@ void renderDock(App& app, WorkstationState& state, const ShellRegions& regions,
     endFixedWindow();
 }
 
-void renderTimeDeck(App& app, WorkstationState& state, const ShellRegions& regions) {
+void renderTimeDeck(App& app, ConsoleSession& session, const ShellRegions& regions) {
     beginFixedWindow("##c3_time_deck", regions.timeDeck);
-    ImGui::Text("%s", timeDeckModeLabel(state.timeMode));
+    ImGui::Text("%s", timeDeckModeLabel(session.transport.mode));
     ImGui::Separator();
 
-    if (app.m_historicMode) {
-        const int total = app.m_historic.numFrames();
-        int frame = app.m_historic.currentFrame();
-        if (ImGui::Button(app.m_historic.playing() ? "Pause" : "Play"))
-            app.m_historic.togglePlay();
+    if (session.transport.stream == StreamKind::Archive) {
+        const int total = app.transportSnapshot().total_frames;
+        int frame = session.transport.cursorFrame;
+        if (ImGui::Button(session.transport.playIntent ? "Pause" : "Play")) {
+            toggleTransportPlay(app, session);
+        }
         ImGui::SameLine();
         if (ImGui::Button("Prev"))
-            app.m_historic.setFrame(std::max(0, frame - 1));
+            transportStep(app, session, -1);
         ImGui::SameLine();
         if (ImGui::Button("Next"))
-            app.m_historic.setFrame(std::min(total - 1, frame + 1));
+            transportStep(app, session, 1);
         ImGui::SameLine();
-        ImGui::Text("%s", app.m_historic.currentLabel().c_str());
+        ImGui::Text("%s", session.transport.currentLabel.c_str());
         if (ImGui::SliderInt("##historic_frame", &frame, 0, std::max(0, total - 1), "Frame %d"))
-            app.m_historic.setFrame(frame);
+            transportSeekFrame(app, session, frame);
     } else {
-        bool liveLoop = app.liveLoopEnabled();
+        bool liveLoop = session.transport.mode != TimeDeckMode::LiveTail;
         if (ImGui::Checkbox("Loop", &liveLoop))
-            app.setLiveLoopEnabled(liveLoop);
+            transportSetLoopEnabled(app, session, liveLoop);
         ImGui::SameLine();
-        if (ImGui::Button(app.liveLoopPlaying() ? "Pause" : "Play"))
-            app.toggleLiveLoopPlayback();
+        if (ImGui::Button(session.transport.playIntent ? "Pause" : "Play")) {
+            toggleTransportPlay(app, session);
+        }
         ImGui::SameLine();
         if (ImGui::Button("Live"))
-            app.setLiveLoopPlaybackFrame(std::max(0, app.liveLoopAvailableFrames() - 1));
+            transportJumpLive(app, session);
         ImGui::SameLine();
         if (ImGui::Button("Clear"))
             app.clearLiveLoop();
         ImGui::SameLine();
-        int frames = app.liveLoopLength();
+        int frames = session.transport.requestedFrames;
         ImGui::SetNextItemWidth(110.0f);
         if (ImGui::SliderInt("Frames", &frames, 1, app.liveLoopMaxFrames()))
-            app.setLiveLoopLength(frames);
+            transportSetRequestedFrames(app, session, frames);
         ImGui::SameLine();
-        float speed = app.liveLoopSpeed();
+        float speed = session.transport.rateFps;
         ImGui::SetNextItemWidth(110.0f);
         if (ImGui::SliderFloat("FPS", &speed, 1.0f, 15.0f, "%.0f"))
-            app.setLiveLoopSpeed(speed);
+            transportSetRate(app, session, speed);
 
-        drawTimeline(app, "##c3_timeline");
-        ImGui::Text("Ready %d / %d", app.liveLoopAvailableFrames(), app.liveLoopLength());
+        drawTimeline(app, session, "##c3_timeline");
+        ImGui::Text("Ready %d / %d", session.transport.readyFrames, session.transport.requestedFrames);
         ImGui::SameLine();
         ImGui::TextDisabled("|");
         ImGui::SameLine();
@@ -488,6 +668,17 @@ void renderTimeDeck(App& app, WorkstationState& state, const ShellRegions& regio
         ImGui::TextDisabled("|");
         ImGui::SameLine();
         ImGui::Text("Rendering %d", app.liveLoopBackfillPendingFrames());
+        if (session.transport.playIntent && !session.transport.isAdvancing && session.transport.loadingFrames > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.46f, 1.0f), "Pending");
+        }
+    }
+
+    if (!session.transport.bookmarks.empty()) {
+        ImGui::Separator();
+        for (const auto& bookmark : session.transport.bookmarks) {
+            ImGui::BulletText("%s  %s", bookmark.label.c_str(), bookmark.timeText.c_str());
+        }
     }
 
     endFixedWindow();
@@ -512,6 +703,66 @@ void applyKeyboardShortcuts(App& app) {
     if (ImGui::IsKeyPressed(ImGuiKey_S)) app.toggleSRV();
     if (ImGui::IsKeyPressed(ImGuiKey_Home)) resetConusView(app);
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) app.setAutoTrackStation(true);
+}
+
+void handleCanvasInteractions(App& app, ConsoleSession& session,
+                              const std::vector<StationUiState>& stations,
+                              const std::vector<WarningPolygon>& warnings,
+                              const ImGuiViewport* mainViewport) {
+    if (g_uiWantsMouseCapture)
+        return;
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    updateHoveredStation(session, app.stationAtScreen(mouse.x, mouse.y));
+    session.alertFocus.hoveredAlertId.clear();
+    int hoveredPane = 0;
+    if (app.radarPanelCount() > 1 && !app.mode3D() && !app.crossSection()) {
+        for (int pane = 0; pane < app.radarPanelCount(); ++pane) {
+            const RadarPanelRect rect = app.radarPanelRect(pane);
+            const ImRect paneRect(
+                ImVec2(mainViewport->Pos.x + (float)rect.x, mainViewport->Pos.y + (float)rect.y),
+                ImVec2(mainViewport->Pos.x + (float)rect.x + rect.width,
+                       mainViewport->Pos.y + (float)rect.y + rect.height));
+            if (paneRect.Contains(mouse)) {
+                hoveredPane = pane;
+                break;
+            }
+        }
+    }
+
+    for (const auto& warning : warnings) {
+        if (pointInWarning(app.cursorLat(), app.cursorLon(), warning)) {
+            session.alertFocus.hoveredAlertId = warning.id;
+            break;
+        }
+    }
+
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        session.activePaneIndex = hoveredPane;
+        applySelectedPaneToApp(app, session);
+
+        const int hitIdx = app.stationAtScreen(mouse.x, mouse.y);
+        if (hitIdx >= 0 && session.alertFocus.hoveredAlertId.empty()) {
+            session.stationWorkflow.followNearest = false;
+            session.stationWorkflow.lockedStationId = hitIdx;
+            app.setAutoTrackStation(false);
+            focusStation(app, session, hitIdx, false, -1.0);
+        }
+
+        for (const auto& warning : warnings) {
+            if (pointInWarning(app.cursorLat(), app.cursorLon(), warning)) {
+                selectAlert(app, session, warnings, stations, warning.id);
+                centerOnWarning(app, warning);
+                break;
+            }
+        }
+    }
+
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const WarningPolygon* selected = findSelectedWarning(session, warnings);
+        if (selected)
+            activateTornadoInterrogate(app, session, warnings, stations);
+    }
 }
 
 } // namespace
@@ -543,20 +794,21 @@ void init() {
 
 void render(App& app) {
     g_uiWantsMouseCapture = false;
-    static WorkstationState state;
-    syncWorkstationStateFromApp(app, state);
+    static ConsoleSession session = defaultConsoleSession();
 
     ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const auto stations = app.stations();
     const auto warnings = app.currentWarnings();
-    const ShellRegions regions = computeRegions(mainViewport, state.contextDockOpen);
+    syncConsoleSessionFromApp(app, stations, warnings, session);
+    const ShellRegions regions = computeRegions(mainViewport, session.contextDockOpen);
 
-    drawCanvas(app, regions, mainViewport);
-    renderTopBar(app, state, regions, stations, warnings);
-    renderRail(app, state, regions);
-    renderDock(app, state, regions, stations, warnings);
-    renderTimeDeck(app, state, regions);
+    drawCanvas(app, session, regions, mainViewport, stations, warnings);
+    renderTopBar(app, session, regions, stations, warnings);
+    renderRail(app, session, regions);
+    renderDock(app, session, regions, stations, warnings);
+    renderTimeDeck(app, session, regions);
     applyKeyboardShortcuts(app);
+    handleCanvasInteractions(app, session, stations, warnings, mainViewport);
 }
 
 void shutdown() {

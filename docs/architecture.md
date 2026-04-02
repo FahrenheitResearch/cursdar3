@@ -34,15 +34,40 @@ The shell is built from five permanent regions:
 
 These regions are fixed. Features move between them contextually rather than spawning permanent windows.
 
-## State model direction
+## State model
 
-The target is explicit session state:
+The shell now centers on explicit session state in `src/ui/workstation.h`:
 
-- global workspace id
-- global time controller
-- pane layout and pane link masks
-- active context selection
-- dock tab state
-- asset drawer state
+- `ConsoleSession`
+- `TransportState`
+- `AlertFocusState`
+- `PaneState`
+- `StationWorkflowState`
 
-This replaces the current `cursdar2` model where live/archive/snapshot/3D/cross-section/loop/show-all/compare are mostly independent flags.
+The current shell model is:
+
+- the shell owns workflow intent
+- the engine owns data, render surfaces, and GPU orchestration
+- `App` exposes transport and selected-alert controller surfaces back to the shell
+
+This replaces the old `cursdar2` pattern where live/archive/snapshot/3D/cross-section/loop/show-all/compare were mostly independent flags.
+
+## Implemented direction
+
+The current bootstrap already includes:
+
+- shell-owned workspace selection
+- shell-owned focused / hovered / locked station workflow state
+- pane-scoped product/tilt selection
+- a unified time deck over live review / archive / snapshot transport
+- selected-alert state bridged into `App`
+- a first alert-driven workspace action: `Tornado Interrogate`
+
+## Next seam to finish
+
+The remaining big architecture step is to replace the last global-engine assumptions with pane-aware engine state:
+
+- pane view transforms
+- pane station bindings that are not forced back to the global active station
+- transport binding per pane/group
+- template application as an engine-facing controller instead of imperative UI macros

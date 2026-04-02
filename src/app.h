@@ -176,6 +176,8 @@ struct RadarPanelRect {
 
 struct RadarPanelConfig {
     int product = PROD_REF;
+    int tilt = 0;
+    int station = -1;
 };
 
 struct RadarPanelCacheState {
@@ -186,6 +188,27 @@ struct RadarPanelCacheState {
     int product = -1;
     int tilt = -1;
     std::string volume_key;
+};
+
+struct TransportSnapshot {
+    bool archive_mode = false;
+    bool snapshot_mode = false;
+    bool review_enabled = false;
+    bool playing = false;
+    bool buffering = false;
+    int requested_frames = 0;
+    int ready_frames = 0;
+    int loading_frames = 0;
+    int cursor_frame = 0;
+    int total_frames = 0;
+    float rate_fps = 0.0f;
+    std::string current_label;
+};
+
+struct AlertSelectionState {
+    std::string selected_alert_id;
+    std::vector<int> candidate_stations;
+    int preferred_station = -1;
 };
 
 class App {
@@ -271,6 +294,8 @@ public:
     RadarPanelRect  radarPanelRect(int index) const;
     int             radarPanelProduct(int index) const;
     void            setRadarPanelProduct(int index, int product);
+    int             radarPanelTilt(int index) const;
+    void            setRadarPanelTilt(int index, int tilt);
     void            setRadarCanvasRect(int x, int y, int width, int height);
     std::vector<WarningPolygon> currentWarnings() const;
     bool            loadColorTableFromFile(const std::string& path);
@@ -298,6 +323,13 @@ public:
     int             liveLoopBackfillFetchTotal() const { return m_liveLoopBackfillFetchTotal.load(); }
     int             liveLoopBackfillFetchCompleted() const { return m_liveLoopBackfillFetchCompleted.load(); }
     void            clearLiveLoop();
+    TransportSnapshot transportSnapshot() const;
+    void            transportSetPlay(bool play);
+    void            transportSeekFrame(int frameIndex);
+    void            transportSetReviewEnabled(bool enabled);
+    void            transportSetRequestedFrames(int frames);
+    void            transportSetRate(float fps);
+    void            transportJumpLive();
     bool            stationEnabled(int idx) const;
     void            setStationEnabled(int idx, bool enabled);
     int             enabledStationCount() const;
@@ -310,6 +342,11 @@ public:
     int             pinnedStationCount() const;
     int             bootstrapStationTarget() const { return m_bootstrapStationTarget; }
     std::string     priorityStatus() const;
+    void            setSelectedAlert(const std::string& alertId,
+                                     std::vector<int> candidateStations,
+                                     int preferredStation = -1);
+    void            clearSelectedAlert();
+    const AlertSelectionState& selectedAlert() const { return m_selectedAlert; }
 
     // Navigation: arrow keys
     void nextProduct();
@@ -529,6 +566,7 @@ private:
     std::vector<ProbSevereObject> m_probSevereObjects;
     std::atomic<bool> m_probSevereLoading{false};
     std::string m_priorityStatus;
+    AlertSelectionState m_selectedAlert;
 
 public:
     // NWS warning overlay

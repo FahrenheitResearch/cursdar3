@@ -14,7 +14,15 @@ The goal is to keep the proven ingest/rendering engine from `cursdar2`, while re
 
 ## Current status
 
-This is the initial workstation-shell rewrite on top of the existing radar engine. `cursdar3` already builds and runs against the current ingest/render/rendering stack; what is still being rebuilt is the shell, workspace model, and interaction architecture.
+This is the initial workstation-shell rewrite on top of the existing radar engine. `cursdar3` already builds and runs against the current ingest/render/rendering stack, and the shell now has a real session model instead of just being a different skin over `cursdar2`.
+
+What is in place now:
+
+- shell-owned `ConsoleSession` / pane / transport / alert-focus state
+- pane-aware command bar and context dock
+- center-canvas ownership for single, dual, and quad layouts
+- a unified time deck that drives live review, archive review, and snapshot state through one shell transport model
+- alert selection with candidate-station resolution and a first real `Tornado Interrogate` workspace action
 
 ## Design rules
 
@@ -26,7 +34,7 @@ This is the initial workstation-shell rewrite on top of the existing radar engin
 
 ## Planned work
 
-1. Lock the workspace/state model.
-2. Replace the remaining flag-heavy app wiring with explicit workspaces and a unified temporal state machine.
-3. Turn compare panes into linked interrogation views instead of layout toggles.
-4. Rebuild warning interrogation, archive/live transport, and asset flows on top of the new shell.
+1. Finish moving workflow authority out of `App` and into the shell/session layer.
+2. Promote pane links from shell state into a real engine-facing pane/view graph.
+3. Unify live loop, archive playback, and snapshots behind a single frame-stream controller.
+4. Turn alert focus and interrogation templates into first-class workflows instead of ad hoc actions.

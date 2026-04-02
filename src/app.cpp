@@ -1263,18 +1263,17 @@ RadarPanelRect App::radarPanelRect(int index) const {
         return {};
 
     RadarPanelRect rect = {};
-    if (count <= 1) {
-        rect.x = 0;
-        rect.y = 0;
-        rect.width = std::max(1, m_viewport.width);
-        rect.height = std::max(1, m_viewport.height);
-        return rect;
-    }
-
     const int canvasX = m_radarCanvasX;
     const int canvasY = m_radarCanvasY;
     const int canvasWidth = std::max(1, m_radarCanvasWidth > 0 ? m_radarCanvasWidth : m_viewport.width);
     const int canvasHeight = std::max(1, m_radarCanvasHeight > 0 ? m_radarCanvasHeight : m_viewport.height);
+    if (count <= 1) {
+        rect.x = canvasX;
+        rect.y = canvasY;
+        rect.width = canvasWidth;
+        rect.height = canvasHeight;
+        return rect;
+    }
 
     if (count == 2) {
         const int leftWidth = std::max(1, canvasWidth / 2);
@@ -1331,6 +1330,14 @@ int App::radarPanelProduct(int index) const {
     return m_radarPanels[index].product;
 }
 
+int App::radarPanelTilt(int index) const {
+    if (index <= 0)
+        return m_activeTilt;
+    if (index >= (int)m_radarPanels.size())
+        return m_activeTilt;
+    return m_radarPanels[index].tilt;
+}
+
 void App::setRadarPanelLayout(RadarPanelLayout layout) {
     if (m_radarPanelLayout == layout)
         return;
@@ -1356,6 +1363,22 @@ void App::setRadarPanelProduct(int index, int product) {
     if (index >= (int)m_radarPanels.size() || m_radarPanels[index].product == product)
         return;
     m_radarPanels[index].product = product;
+    m_panelCacheStates[index].valid = false;
+    resetHistoricFrameCache(true);
+    m_needsRerender = true;
+}
+
+void App::setRadarPanelTilt(int index, int tilt) {
+    if (index <= 0) {
+        setTilt(tilt);
+        return;
+    }
+    if (index >= (int)m_radarPanels.size())
+        return;
+    tilt = std::max(0, std::min(tilt, std::max(0, m_maxTilts - 1)));
+    if (m_radarPanels[index].tilt == tilt)
+        return;
+    m_radarPanels[index].tilt = tilt;
     m_panelCacheStates[index].valid = false;
     resetHistoricFrameCache(true);
     m_needsRerender = true;
@@ -1857,6 +1880,20 @@ int App::pinnedStationCount() const {
 std::string App::priorityStatus() const {
     std::lock_guard<std::mutex> lock(m_priorityMutex);
     return m_priorityStatus;
+}
+
+void App::setSelectedAlert(const std::string& alertId,
+                           std::vector<int> candidateStations,
+                           int preferredStation) {
+    m_selectedAlert.selected_alert_id = alertId;
+    m_selectedAlert.candidate_stations = std::move(candidateStations);
+    m_selectedAlert.preferred_station = preferredStation;
+}
+
+void App::clearSelectedAlert() {
+    m_selectedAlert.selected_alert_id.clear();
+    m_selectedAlert.candidate_stations.clear();
+    m_selectedAlert.preferred_station = -1;
 }
 
 float App::priorityScoreForStation(int stationIdx,
@@ -2769,6 +2806,74 @@ std::string App::liveLoopVolumeKeyAtFrame(int index) const {
 
 void App::clearLiveLoop() {
     invalidateLiveLoop(true);
+}
+
+TransportSnapshot App::transportSnapshot() const {
+    TransportSnapshot snapshot;
+    snapshot.archive_mode = m_historicMode;
+    snapshot.snapshot_mode = m_snapshotMode;
+    snapshot.review_enabled = m_liveLoopEnabled;
+    snapshot.playing = m_historicMode ? m_historic.playing() : m_liveLoopPlaying;
+    snapshot.buffering = m_liveLoopBackfillLoading.load();
+    snapshot.requested_frames = m_historicMode ? std::max(1, m_historic.numFrames()) : m_liveLoopLength;
+    snapshot.ready_frames = m_historicMode ? m_historic.numFrames() : m_liveLoopCount;
+    snapshot.loading_frames = m_historicMode ? 0 :
+        std::max(m_liveLoopBackfillFetchTotal.load() - m_liveLoopBackfillFetchCompleted.load(), 0) +
+        std::max(m_liveLoopBackfillQueueCount.load(), 0);
+    snapshot.cursor_frame = m_historicMode ? m_historic.currentFrame() : m_liveLoopPlaybackIndex;
+    snapshot.total_frames = m_historicMode ? m_historic.numFrames() : m_liveLoopCount;
+    snapshot.rate_fps = m_historicMode ? 0.0f : m_liveLoopSpeed;
+    snapshot.current_label = m_historicMode ? m_historic.currentLabel() :
+        (m_snapshotMode ? m_snapshotLabel : liveLoopCurrentLabel());
+    return snapshot;
+}
+
+void App::transportSetPlay(bool play) {
+    if (m_historicMode) {
+        if (m_historic.playing() != play)
+            m_historic.togglePlay();
+        return;
+    }
+    if (!m_liveLoopEnabled && play)
+        setLiveLoopEnabled(true);
+    if (m_liveLoopPlaying != play)
+        toggleLiveLoopPlayback();
+}
+
+void App::transportSeekFrame(int frameIndex) {
+    if (m_historicMode) {
+        m_historic.setFrame(frameIndex);
+        return;
+    }
+    setLiveLoopPlaybackFrame(frameIndex);
+}
+
+void App::transportSetReviewEnabled(bool enabled) {
+    if (m_historicMode || m_snapshotMode)
+        return;
+    setLiveLoopEnabled(enabled);
+}
+
+void App::transportSetRequestedFrames(int frames) {
+    if (m_historicMode || m_snapshotMode)
+        return;
+    setLiveLoopLength(frames);
+}
+
+void App::transportSetRate(float fps) {
+    if (m_historicMode)
+        return;
+    setLiveLoopSpeed(fps);
+}
+
+void App::transportJumpLive() {
+    if (m_historicMode) {
+        const int total = m_historic.numFrames();
+        if (total > 0)
+            m_historic.setFrame(total - 1);
+        return;
+    }
+    setLiveLoopPlaybackFrame(std::max(0, m_liveLoopCount - 1));
 }
 
 void App::updateMemoryTelemetry(bool force) {
@@ -4230,6 +4335,7 @@ void App::update(float dt) {
 
 void App::renderPane(int paneIndex, uint32_t* d_output) {
     const int product = (paneIndex == 0) ? m_activeProduct : radarPanelProduct(paneIndex);
+    const int tilt = (paneIndex == 0) ? m_activeTilt : radarPanelTilt(paneIndex);
     const int rw = panelRenderWidth(paneIndex);
     const int rh = panelRenderHeight(paneIndex);
     GpuViewport gpuVp;
@@ -4303,7 +4409,7 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
         const int slot = (primaryPane || canUsePrimarySlot) ? 0 : (kPanelCacheSlotBase + paneIndex);
         bool uploaded = primaryPane
             ? (m_historic.frame(currentFrame) && m_historic.frame(currentFrame)->ready)
-            : (canUsePrimarySlot || ensurePanelCacheUpload(paneIndex, product, m_activeTilt));
+            : (canUsePrimarySlot || ensurePanelCacheUpload(paneIndex, product, tilt));
         if (!uploaded) {
             CUDA_CHECK(cudaMemset(d_output, 0, (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
             return;
@@ -4370,7 +4476,7 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
             if (canUsePrimarySlot) {
                 gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
                                           product, activeThreshold, d_output, srvSpd, srvDir);
-            } else if (ensurePanelCacheUpload(paneIndex, product, m_activeTilt)) {
+            } else if (ensurePanelCacheUpload(paneIndex, product, tilt)) {
                 gpu::forwardRenderStation(gpuVp, kPanelCacheSlotBase + paneIndex,
                                           product, activeThreshold, d_output, srvSpd, srvDir);
             } else {
@@ -4512,7 +4618,7 @@ void App::onMouseMove(double mx, double my) {
             break;
         }
     }
-    if (!insidePanel && panelCount > 1)
+    if (!insidePanel)
         return;
 
     const RadarPanelRect rect = radarPanelRect(panelIdx);
@@ -4572,7 +4678,7 @@ int App::stationAtScreen(double mx, double my, float radiusPx) const {
             break;
         }
     }
-    if (!insidePanel && panelCount > 1)
+    if (!insidePanel)
         return -1;
 
     const RadarPanelRect rect = radarPanelRect(panelIdx);
@@ -4707,6 +4813,7 @@ void App::setProduct(int p) {
     m_activeProduct = p;
     m_radarPanels[0].product = p;
     m_activeTilt = 0; // reset tilt - different products have different valid tilts
+    m_radarPanels[0].tilt = 0;
     m_lastHistoricFrame = -1; // force re-upload in historic mode
     m_maxTilts = 1;
     m_volumeBuilt = false;
@@ -4748,10 +4855,12 @@ void App::setTilt(int t) {
     if (t < 0) t = 0;
     if (t >= m_maxTilts) t = m_maxTilts - 1;
     if (t == m_activeTilt) {
+        m_radarPanels[0].tilt = t;
         refreshActiveTiltMetadata();
         return;
     }
     m_activeTilt = t;
+    m_radarPanels[0].tilt = t;
     m_volumeBuilt = false;
     m_volumeStation = -1;
     invalidatePanelCaches();

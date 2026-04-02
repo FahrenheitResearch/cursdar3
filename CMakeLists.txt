@@ -89,8 +89,8 @@ add_executable(cursdar3
     src/render/color_table.cpp
     src/render/gl_interop.cpp
     src/render/gl_texture.cpp
-    src/ui/workstation_state.cpp
-    src/ui/workstation_shell.cpp
+    src/ui/ui.cpp
+    src/ui/workstation.cpp
     src/cuda/renderer.cu
     src/cuda/preprocess.cu
     src/cuda/gpu_tensor.cu

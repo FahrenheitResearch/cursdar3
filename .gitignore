@@ -1,4 +1,5 @@
 build/
+build_fresh/
 imgui.ini
 *.obj
 *.pdb
@@ -10,3 +11,6 @@ imgui.ini
 *.user
 *.sln
 *.vcxproj*
+.vs/
+.idea/
+out/

@@ -41,7 +41,7 @@ static void windowSizeCallback(GLFWwindow* window, int width, int height) {
 
 int main(int argc, char** argv) {
     printf("=== CURSDAR3 - Radar Interrogation Console ===\n");
-    printf("Loading the next-generation workstation shell on the CUDA radar engine\n\n");
+    printf("Loading next-generation shell on the CUDA radar engine\n\n");
 #ifdef _WIN32
     SetProcessDPIAware();
 #endif

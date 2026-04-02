@@ -259,12 +259,12 @@ BasemapRenderer::BasemapRenderer()
     char localAppData[MAX_PATH] = "";
     DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, (DWORD)sizeof(localAppData));
     if (len > 0 && len < sizeof(localAppData)) {
-        m_diskCacheDir = std::filesystem::path(localAppData) / "cursdar2" / "basemap_cache";
+        m_diskCacheDir = std::filesystem::path(localAppData) / "cursdar3" / "basemap_cache";
     } else {
-        m_diskCacheDir = std::filesystem::temp_directory_path() / "cursdar2_basemap_cache";
+        m_diskCacheDir = std::filesystem::temp_directory_path() / "cursdar3_basemap_cache";
     }
 #else
-    m_diskCacheDir = std::filesystem::temp_directory_path() / "cursdar2_basemap_cache";
+    m_diskCacheDir = std::filesystem::temp_directory_path() / "cursdar3_basemap_cache";
 #endif
     std::error_code ec;
     std::filesystem::create_directories(m_diskCacheDir, ec);

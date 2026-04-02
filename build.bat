@@ -1,27 +1,21 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 cd /d %~dp0
 
 echo === CURSDAR3 Build ===
-echo.
 
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" amd64 >nul 2>&1
-set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin;%PATH%"
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" (
+    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 >nul
+)
 
 if not exist build mkdir build
 cd build
 
-cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1
-if errorlevel 1 (
-    echo ERROR: CMake configuration failed
-    exit /b 1
-)
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+if errorlevel 1 exit /b 1
 
-cmake --build . -j 2>&1
-if errorlevel 1 (
-    echo ERROR: Build failed
-    exit /b 1
-)
+cmake --build . --config Release
+if errorlevel 1 exit /b 1
 
 echo.
 echo === Build successful ===

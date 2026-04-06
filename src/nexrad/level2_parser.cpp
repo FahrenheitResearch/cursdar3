@@ -607,6 +607,18 @@ ParsedRadarData Level2Parser::parseDecodedMessagesPreview(const std::vector<uint
     return result;
 }
 
+ParsedRadarData Level2Parser::parseDecodedMessagesPartial(const std::vector<uint8_t>& decodedBytes,
+                                                          const std::string& stationId) {
+    ParsedRadarData result;
+    result.station_id = stationId;
+    if (decodedBytes.empty())
+        return result;
+
+    parseMessages(decodedBytes.data(), decodedBytes.size(), result);
+    organizeSweeps(result, true);
+    return result;
+}
+
 ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData,
                                     ProgressCallback cb) {
     ParsedRadarData result;

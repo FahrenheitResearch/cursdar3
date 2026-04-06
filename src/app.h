@@ -20,6 +20,7 @@
 #include <memory>
 #include <chrono>
 #include <cstddef>
+#include <map>
 #include <unordered_set>
 
 #include "nexrad/sweep_data.h"
@@ -42,6 +43,12 @@ struct LiveVolumeHistoryEntry {
     float station_lon = 0.0f;
 };
 
+struct LiveChunkRecord {
+    std::string key;
+    std::vector<uint8_t> data;
+    char part = 'I';
+};
+
 struct LiveChunkVolumeState {
     int volume_id = -1;
     std::string volume_key;
@@ -50,6 +57,10 @@ struct LiveChunkVolumeState {
     std::vector<uint8_t> assembled_bytes;
     bool saw_start = false;
     bool saw_end = false;
+    int start_sequence = -1;
+    int highest_contiguous_sequence = -1;
+    bool contiguous_saw_end = false;
+    std::map<int, LiveChunkRecord> records;
     bool published_partial = false;
 };
 
@@ -95,6 +106,10 @@ struct StationState {
     PipelineStageTimings timings;
     std::deque<LiveVolumeHistoryEntry> live_history;
     LiveChunkVolumeState live_chunk;
+    std::vector<PrecomputedSweep> preview_precomputed;
+    float preview_data_lat = 0.0f;
+    float preview_data_lon = 0.0f;
+    std::string preview_volume_key;
     bool preview_partial = false;
     int preview_sweep_count = 0;
     int preview_radial_count = 0;
@@ -110,6 +125,8 @@ struct StationUiState {
     float        lat = 0.0f, lon = 0.0f;
     float        display_lat = 0.0f, display_lon = 0.0f;
     std::string  latest_scan_utc;
+    std::string  last_full_scan_utc;
+    std::string  partial_sweep_utc;
     bool         enabled = false;
     bool         pinned = false;
     bool         priority_hot = false;
@@ -430,7 +447,7 @@ private:
     void finishLivePollNoChange(int stationIdx, uint64_t generation);
     bool tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
                             bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
-                            const std::string& volumeKey);
+                            const std::string& volumeKey, bool suppressFastPreview = false);
     bool tryProcessChunkProgress(int stationIdx, const std::vector<uint8_t>& assembledBytes,
                                  uint64_t generation, bool dealiasEnabled,
                                  const std::string& volumeKey, bool finalChunk);
@@ -442,6 +459,10 @@ private:
     void trimStationWorkingSet(int focusIdx = -1);
     bool shouldKeepStationFullVolumeLocked(int stationIdx, int focusIdx) const;
     void trimStationToLowestSweepLocked(StationState& st);
+    void clearStationPreviewLocked(StationState& st);
+    bool shouldUseProvisionalPreviewLocked(const StationState& st, int stationIdx,
+                                           int product, int tilt,
+                                           bool lowestSweepUpload) const;
     bool stationLikelyVisible(int stationIdx) const;
     float livePollIntervalSecForStation(int stationIdx, const StationState& st) const;
     PerformanceProfile recommendedPerformanceProfile() const;

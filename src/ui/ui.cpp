@@ -739,8 +739,14 @@ void renderDock(App& app, ConsoleSession& session, const ShellRegions& regions,
             ImGui::Text("RAM %s", formatBytes(mem.process_working_set_bytes).c_str());
             if (session.stationWorkflow.focusedStationId >= 0 && session.stationWorkflow.focusedStationId < (int)stations.size()) {
                 const auto& st = stations[session.stationWorkflow.focusedStationId];
-                if (!st.latest_scan_utc.empty())
+                if (st.preview_partial) {
+                    if (!st.partial_sweep_utc.empty())
+                        ImGui::Text("Partial sweep: %s", st.partial_sweep_utc.c_str());
+                    if (!st.last_full_scan_utc.empty())
+                        ImGui::Text("Last full scan: %s", st.last_full_scan_utc.c_str());
+                } else if (!st.latest_scan_utc.empty()) {
                     ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
+                }
                 if (st.preview_partial) {
                     ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.46f, 1.0f),
                                        "Partial live preview: %d radials in %d sweep%s",

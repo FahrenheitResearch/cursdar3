@@ -23,6 +23,10 @@ public:
                                                        float maxElevationDeg = 1.5f,
                                                        int minRadials = 64);
 
+    // Parse all currently available decoded messages, preserving partial sweeps.
+    static ParsedRadarData parseDecodedMessagesPartial(const std::vector<uint8_t>& decodedBytes,
+                                                       const std::string& stationId = {});
+
     // Parse raw file bytes into structured radar data.
     // Returns empty data on failure.
     static ParsedRadarData parse(const std::vector<uint8_t>& fileData);

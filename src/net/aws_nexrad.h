@@ -411,6 +411,9 @@ inline bool extractRadarFileDateTime(const std::string& keyOrFilename,
         if (i + 15 <= filename.size() && filename[i + 8] == '_' && isDigitSpan(filename, i + 9, 6)) {
             timePos = i + 9;
             timeDigits = 6;
+        } else if (i + 16 <= filename.size() && filename[i + 8] == '-' && isDigitSpan(filename, i + 9, 6)) {
+            timePos = i + 9;
+            timeDigits = 6;
         } else if (i + 13 <= filename.size() && filename[i + 8] == '_' && isDigitSpan(filename, i + 9, 4)) {
             timePos = i + 9;
             timeDigits = 4;

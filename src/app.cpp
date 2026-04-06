@@ -29,8 +29,10 @@ using json = nlohmann::json;
 constexpr float kPi = 3.14159265f;
 constexpr float kDegToRad = kPi / 180.0f;
 constexpr float kInvalidSample = -9999.0f;
-constexpr int kChunkPreviewMinRadials = 96;
-constexpr float kChunkPreviewMinAzimuthSpanDeg = 90.0f;
+constexpr int kChunkPreviewMinRadialsNoBase = 96;
+constexpr float kChunkPreviewMinContiguousArcNoBaseDeg = 180.0f;
+constexpr int kChunkPreviewMinRadialsWithBase = 12;
+constexpr float kChunkPreviewMinContiguousArcWithBaseDeg = 12.0f;
 constexpr const char* kProbSevereHost = "mrms.ncep.noaa.gov";
 constexpr const char* kProbSevereIndexPath = "/ProbSevere/PROBSEVERE/";
 thread_local gpu_tensor::TensorWorkspace g_detectionTensorWorkspace;
@@ -143,6 +145,214 @@ float parsedSweepAzimuthSpanDeg(const ParsedSweep& sweep) {
     return std::clamp(360.0f - largestGap, 0.0f, 360.0f);
 }
 
+bool parsedSweepHasProduct(const ParsedSweep& sweep, int product);
+
+struct SweepCoverageMetrics {
+    float covered_fraction = 0.0f;
+    float longest_contiguous_arc_deg = 0.0f;
+    int occupied_bins = 0;
+};
+
+SweepCoverageMetrics computeParsedSweepCoverageMetrics(const ParsedSweep& sweep) {
+    constexpr int kBins = 720;
+    SweepCoverageMetrics metrics;
+    if (sweep.radials.empty())
+        return metrics;
+
+    std::array<uint8_t, kBins> occupied = {};
+    for (const auto& radial : sweep.radials) {
+        int bin = (int)std::lround(radial.azimuth * 2.0f) % kBins;
+        if (bin < 0)
+            bin += kBins;
+        occupied[(size_t)bin] = 1;
+    }
+
+    for (uint8_t value : occupied)
+        metrics.occupied_bins += value ? 1 : 0;
+    metrics.covered_fraction = (float)metrics.occupied_bins / (float)kBins;
+
+    int longestRun = 0;
+    int currentRun = 0;
+    for (int i = 0; i < kBins * 2; ++i) {
+        if (occupied[(size_t)(i % kBins)]) {
+            ++currentRun;
+            longestRun = std::max(longestRun, currentRun);
+        } else {
+            currentRun = 0;
+        }
+        if (i >= kBins && currentRun == 0)
+            break;
+    }
+    longestRun = std::min(longestRun, kBins);
+    metrics.longest_contiguous_arc_deg = (float)longestRun * 0.5f;
+    return metrics;
+}
+
+int findLowestParsedSweepIndexForProduct(const ParsedRadarData& parsed,
+                                         int preferredProduct,
+                                         float maxElevationDeg) {
+    int bestIdx = -1;
+    float bestElev = std::numeric_limits<float>::max();
+    int bestProducts = -1;
+    int bestRadials = -1;
+
+    auto considerProduct = [&](int requiredProduct) {
+        for (int i = 0; i < (int)parsed.sweeps.size(); ++i) {
+            const auto& sweep = parsed.sweeps[i];
+            if (sweep.radials.empty())
+                continue;
+            if (maxElevationDeg > 0.0f && sweep.elevation_angle > maxElevationDeg)
+                continue;
+            if (requiredProduct >= 0 && !parsedSweepHasProduct(sweep, requiredProduct))
+                continue;
+
+            int productCount = 0;
+            for (int p = 0; p < NUM_PRODUCTS; ++p)
+                productCount += parsedSweepHasProduct(sweep, p) ? 1 : 0;
+
+            if (bestIdx < 0 ||
+                sweep.elevation_angle < bestElev - 0.05f ||
+                (fabsf(sweep.elevation_angle - bestElev) <= 0.05f && productCount > bestProducts) ||
+                (fabsf(sweep.elevation_angle - bestElev) <= 0.05f && productCount == bestProducts &&
+                 (int)sweep.radials.size() > bestRadials)) {
+                bestIdx = i;
+                bestElev = sweep.elevation_angle;
+                bestProducts = productCount;
+                bestRadials = (int)sweep.radials.size();
+            }
+        }
+    };
+
+    considerProduct(preferredProduct);
+    if (bestIdx < 0)
+        considerProduct(-1);
+    return bestIdx;
+}
+
+int findNearestAzimuthIndex(const std::vector<float>& azimuths, float targetDeg) {
+    if (azimuths.empty())
+        return -1;
+    int bestIdx = 0;
+    float bestDelta = angleDeltaDeg(azimuths[0], targetDeg);
+    for (int i = 1; i < (int)azimuths.size(); ++i) {
+        const float delta = angleDeltaDeg(azimuths[i], targetDeg);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestIdx = i;
+        }
+    }
+    return bestIdx;
+}
+
+void copyRadialColumn(const PrecomputedSweep::ProductData& src, int srcRadialIdx,
+                      PrecomputedSweep::ProductData& dst, int dstRadialIdx,
+                      int srcNumRadials, int dstNumRadials) {
+    if (!src.has_data || !dst.has_data || srcRadialIdx < 0 || dstRadialIdx < 0)
+        return;
+    const int gateCount = std::min(src.num_gates, dst.num_gates);
+    for (int gate = 0; gate < gateCount; ++gate) {
+        const size_t srcIndex = (size_t)gate * srcNumRadials + srcRadialIdx;
+        const size_t dstIndex = (size_t)gate * dstNumRadials + dstRadialIdx;
+        if (srcIndex >= src.gates.size() || dstIndex >= dst.gates.size())
+            break;
+        dst.gates[dstIndex] = src.gates[srcIndex];
+    }
+}
+
+PrecomputedSweep composeChunkPreviewSweep(const PrecomputedSweep* base,
+                                          const PrecomputedSweep& overlay) {
+    if (!base || base->num_radials <= 0)
+        return overlay;
+
+    PrecomputedSweep composite = *base;
+    composite.meta.sweep_number = overlay.meta.sweep_number;
+    composite.meta.sweep_start_epoch_ms = overlay.meta.sweep_start_epoch_ms;
+    composite.meta.sweep_end_epoch_ms = overlay.meta.sweep_end_epoch_ms;
+    composite.meta.sweep_display_epoch_ms = overlay.meta.sweep_display_epoch_ms;
+    composite.meta.timing_exact = overlay.meta.timing_exact;
+    composite.meta.boundary_complete = overlay.meta.boundary_complete;
+    composite.elevation_angle = overlay.elevation_angle;
+
+    for (int srcRadial = 0; srcRadial < overlay.num_radials; ++srcRadial) {
+        const int dstRadial = findNearestAzimuthIndex(composite.azimuths, overlay.azimuths[srcRadial]);
+        if (dstRadial < 0)
+            continue;
+        if (dstRadial < (int)composite.radial_time_offset_ms.size() &&
+            srcRadial < (int)overlay.radial_time_offset_ms.size()) {
+            composite.radial_time_offset_ms[dstRadial] = overlay.radial_time_offset_ms[srcRadial];
+        }
+
+        for (int product = 0; product < NUM_PRODUCTS; ++product) {
+            const auto& srcPd = overlay.products[product];
+            if (!srcPd.has_data)
+                continue;
+            auto& dstPd = composite.products[product];
+            if (!dstPd.has_data) {
+                dstPd.has_data = true;
+                dstPd.num_gates = srcPd.num_gates;
+                dstPd.first_gate_km = srcPd.first_gate_km;
+                dstPd.gate_spacing_km = srcPd.gate_spacing_km;
+                dstPd.scale = srcPd.scale;
+                dstPd.offset = srcPd.offset;
+                dstPd.gates.assign((size_t)dstPd.num_gates * composite.num_radials, 0);
+            }
+            composite.meta.product_mask |= (1u << product);
+            copyRadialColumn(srcPd, srcRadial, dstPd, dstRadial,
+                             overlay.num_radials, composite.num_radials);
+        }
+    }
+    return composite;
+}
+
+bool rebuildLiveChunkContiguousPrefix(LiveChunkVolumeState& state) {
+    state.assembled_bytes.clear();
+    state.chunk_keys.clear();
+    state.saw_start = false;
+    state.saw_end = false;
+    state.start_sequence = -1;
+    state.highest_contiguous_sequence = -1;
+    state.contiguous_saw_end = false;
+
+    for (const auto& [sequence, record] : state.records) {
+        if (record.part == 'S') {
+            state.start_sequence = sequence;
+            break;
+        }
+    }
+    if (state.start_sequence < 0)
+        return false;
+
+    size_t totalBytes = 0;
+    for (int sequence = state.start_sequence;; ++sequence) {
+        auto it = state.records.find(sequence);
+        if (it == state.records.end())
+            break;
+        totalBytes += it->second.data.size();
+        state.highest_contiguous_sequence = sequence;
+        if (it->second.part == 'E')
+            state.contiguous_saw_end = true;
+    }
+    if (state.highest_contiguous_sequence < state.start_sequence)
+        return false;
+
+    state.assembled_bytes.reserve(totalBytes);
+    state.saw_start = true;
+    for (int sequence = state.start_sequence; sequence <= state.highest_contiguous_sequence; ++sequence) {
+        auto it = state.records.find(sequence);
+        if (it == state.records.end())
+            break;
+        state.chunk_keys.push_back(it->second.key);
+        state.latest_chunk_key = it->second.key;
+        state.assembled_bytes.insert(state.assembled_bytes.end(),
+                                     it->second.data.begin(), it->second.data.end());
+        if (it->second.part == 'E') {
+            state.saw_end = true;
+            break;
+        }
+    }
+    return !state.assembled_bytes.empty();
+}
+
 bool explicitTiltAllowed(const SweepFilter& filter, float elevationDeg) {
     if (filter.explicit_tilt_set_deg.empty())
         return true;
@@ -241,6 +451,29 @@ std::string makeIsoUtcTimestamp(int year, int month, int day, int hour, int minu
     std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                   year, month, day, hour, minute, second);
     return buffer;
+}
+
+int64_t makeUtcEpoch(int year, int month, int day, int hh, int mm, int ss) {
+    std::tm tm = {};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hh;
+    tm.tm_min = mm;
+    tm.tm_sec = ss;
+#ifdef _WIN32
+    return static_cast<int64_t>(_mkgmtime(&tm));
+#else
+    return static_cast<int64_t>(timegm(&tm));
+#endif
+}
+
+int64_t extractVolumeKeyEpoch(const std::string& key) {
+    int year = 0, month = 0, day = 0;
+    int hh = 0, mm = 0, ss = 0;
+    if (!extractRadarFileDateTime(key, year, month, day, hh, mm, ss))
+        return 0;
+    return makeUtcEpoch(year, month, day, hh, mm, ss);
 }
 
 float stationPollJitter(int stationIdx) {
@@ -1665,6 +1898,32 @@ void App::trimStationToLowestSweepLocked(StationState& st) {
     st.full_volume_resident = false;
 }
 
+void App::clearStationPreviewLocked(StationState& st) {
+    st.preview_precomputed.clear();
+    st.preview_data_lat = 0.0f;
+    st.preview_data_lon = 0.0f;
+    st.preview_volume_key.clear();
+    st.preview_partial = false;
+    st.preview_sweep_count = 0;
+    st.preview_radial_count = 0;
+}
+
+bool App::shouldUseProvisionalPreviewLocked(const StationState& st, int stationIdx,
+                                            int product, int tilt,
+                                            bool lowestSweepUpload) const {
+    if (lowestSweepUpload || m_snapshotMode || m_historicMode)
+        return false;
+    if (stationIdx != m_activeStationIdx || stationIdx < 0)
+        return false;
+    if (m_showAll || m_mode3D || m_crossSection)
+        return false;
+    if (!st.preview_partial || st.preview_precomputed.empty())
+        return false;
+    if (tilt != 0)
+        return false;
+    return countProductSweeps(st.preview_precomputed, product) > 0;
+}
+
 void App::trimStationWorkingSet(int focusIdx) {
     std::lock_guard<std::mutex> lock(m_stationMutex);
     for (int i = 0; i < (int)m_stations.size(); i++) {
@@ -2026,9 +2285,7 @@ void App::setStationEnabled(int idx, bool enabled) {
             st.detection = {};
             st.live_history.clear();
             st.live_chunk = {};
-            st.preview_partial = false;
-            st.preview_sweep_count = 0;
-            st.preview_radial_count = 0;
+            clearStationPreviewLocked(st);
             st.uploaded_product = -1;
             st.uploaded_tilt = -1;
             st.uploaded_sweep = -1;
@@ -3473,9 +3730,7 @@ void App::failDownload(int stationIdx, uint64_t generation, std::string error) {
     st.failed = true;
     st.error = std::move(error);
     st.live_chunk = {};
-    st.preview_partial = false;
-    st.preview_sweep_count = 0;
-    st.preview_radial_count = 0;
+    clearStationPreviewLocked(st);
     if (st.downloading) {
         st.downloading = false;
         m_stationsDownloading--;
@@ -3700,7 +3955,7 @@ bool App::tryProcessChunkProgress(int stationIdx, const std::vector<uint8_t>& as
 
     if (finalChunk) {
         return tryProcessDownload(stationIdx, assembledBytes, generation,
-                                  false, false, dealiasEnabled, volumeKey);
+                                  false, false, dealiasEnabled, volumeKey, true);
     }
 
     const bool canPublishPartialRadialPreview =
@@ -3720,32 +3975,68 @@ bool App::tryProcessChunkProgress(int stationIdx, const std::vector<uint8_t>& as
 
     const std::string stationName = NEXRAD_STATIONS[stationIdx].icao;
     ParsedRadarData previewParsed =
-        Level2Parser::parseDecodedMessagesPreview(decoded, stationName, 1.5f, 32);
-    const int previewLowestIdx = findLowestParsedSweepIndex(previewParsed);
+        Level2Parser::parseDecodedMessagesPartial(decoded, stationName);
+    const int previewLowestIdx = findLowestParsedSweepIndexForProduct(previewParsed, m_activeProduct, 1.5f);
     if (previewLowestIdx < 0 || previewLowestIdx >= (int)previewParsed.sweeps.size())
         return false;
 
+    const ParsedSweep& previewSweep = previewParsed.sweeps[previewLowestIdx];
+    if (previewSweep.radials.empty())
+        return false;
+    const SweepCoverageMetrics coverage = computeParsedSweepCoverageMetrics(previewSweep);
+
     bool alreadyPublished = false;
+    bool haveBaseSweep = false;
+    PrecomputedSweep baseSweep;
     {
         std::lock_guard<std::mutex> lock(m_stationMutex);
         if (!isCurrentDownloadGeneration(generation))
             return false;
-        if (stationIdx >= 0 && stationIdx < (int)m_stations.size())
+        if (stationIdx >= 0 && stationIdx < (int)m_stations.size()) {
             alreadyPublished = m_stations[stationIdx].live_chunk.published_partial;
+            const auto& st = m_stations[stationIdx];
+            int sameSweepIdx = -1;
+            for (int i = 0; i < (int)st.precomputed.size(); ++i) {
+                if (st.precomputed[i].meta.sweep_number != previewSweep.sweep_number)
+                    continue;
+                if (!st.precomputed[i].products[m_activeProduct].has_data)
+                    continue;
+                sameSweepIdx = i;
+                break;
+            }
+            int fallbackIdx = sameSweepIdx;
+            if (fallbackIdx < 0) {
+                for (int i = 0; i < (int)st.precomputed.size(); ++i) {
+                    if (!st.precomputed[i].products[m_activeProduct].has_data)
+                        continue;
+                    if (fallbackIdx < 0 ||
+                        st.precomputed[i].elevation_angle < st.precomputed[fallbackIdx].elevation_angle - 0.05f) {
+                        fallbackIdx = i;
+                    }
+                }
+            }
+            if (fallbackIdx >= 0 && fallbackIdx < (int)st.precomputed.size()) {
+                baseSweep = st.precomputed[fallbackIdx];
+                haveBaseSweep = baseSweep.num_radials > 0;
+            }
+        }
     }
 
-    const ParsedSweep& previewSweep = previewParsed.sweeps[previewLowestIdx];
-    const float previewSpanDeg = parsedSweepAzimuthSpanDeg(previewSweep);
+    const bool enoughForFirstPublish = haveBaseSweep
+        ? ((int)previewSweep.radials.size() >= kChunkPreviewMinRadialsWithBase &&
+           coverage.longest_contiguous_arc_deg >= kChunkPreviewMinContiguousArcWithBaseDeg)
+        : ((int)previewSweep.radials.size() >= kChunkPreviewMinRadialsNoBase &&
+           coverage.longest_contiguous_arc_deg >= kChunkPreviewMinContiguousArcNoBaseDeg);
     if (!alreadyPublished &&
-        ((int)previewSweep.radials.size() < kChunkPreviewMinRadials ||
-         previewSpanDeg < kChunkPreviewMinAzimuthSpanDeg)) {
+        !enoughForFirstPublish) {
         return false;
     }
 
-    std::vector<PrecomputedSweep> previewSweeps;
-    previewSweeps.push_back(buildPrecomputedSweep(previewSweep));
-    if (previewSweeps.empty())
+    PrecomputedSweep partialSweep = buildPrecomputedSweep(previewSweep);
+    if (partialSweep.num_radials <= 0)
         return false;
+    std::vector<PrecomputedSweep> previewSweeps;
+    previewSweeps.push_back(composeChunkPreviewSweep(haveBaseSweep ? &baseSweep : nullptr, partialSweep));
     if (dealiasEnabled)
         dealiasPrecomputedSweeps(previewSweeps);
     if (countProductSweeps(previewSweeps, m_activeProduct) <= 0)
@@ -3758,21 +4049,16 @@ bool App::tryProcessChunkProgress(int stationIdx, const std::vector<uint8_t>& as
         auto& st = m_stations[stationIdx];
         if (!st.enabled)
             return false;
-        st.total_sweeps = std::max(1, (int)previewParsed.sweeps.size());
-        st.lowest_sweep_elev = previewSweeps.front().elevation_angle;
-        st.lowest_sweep_radials = previewSweeps.front().num_radials;
-        st.data_lat = previewParsed.station_lat != 0.0f ? previewParsed.station_lat : st.lat;
-        st.data_lon = previewParsed.station_lon != 0.0f ? previewParsed.station_lon : st.lon;
-        st.precomputed = std::move(previewSweeps);
-        st.full_volume_resident = false;
-        st.parsed = true;
         st.failed = false;
         st.error.clear();
+        st.preview_precomputed = std::move(previewSweeps);
+        st.preview_data_lat = previewParsed.station_lat != 0.0f ? previewParsed.station_lat : st.lat;
+        st.preview_data_lon = previewParsed.station_lon != 0.0f ? previewParsed.station_lon : st.lon;
+        st.preview_volume_key = volumeKey;
         st.preview_partial = true;
         st.preview_sweep_count = 1;
-        st.preview_radial_count = st.precomputed.front().num_radials;
+        st.preview_radial_count = partialSweep.num_radials;
         st.lastUpdate = std::chrono::steady_clock::now();
-        st.latestVolumeKey = volumeKey;
         st.uploaded = false;
         st.uploaded_product = -1;
         st.uploaded_tilt = -1;
@@ -3878,6 +4164,33 @@ void App::queueLiveChunkStationRefresh(int stationIdx, bool force) {
                 return;
             }
 
+            const int64_t latestChunkEpoch = extractVolumeKeyEpoch(chunks.back().key);
+            int listYear = 0, listMonth = 0, listDay = 0;
+            getUtcDate(listYear, listMonth, listDay);
+            auto loadLatestPublishedKey = [&](int year, int month, int day, std::vector<NexradFile>& outFiles) {
+                const char* siteHost = radarDataHost(site);
+                auto fileListResult = Downloader::httpGet(siteHost, buildLiveListQuery(site, year, month, day, {}));
+                if (!fileListResult.success || fileListResult.data.empty())
+                    return false;
+                outFiles = parseRadarListResponse(site, fileListResult.data);
+                return !outFiles.empty();
+            };
+
+            std::vector<NexradFile> latestFiles;
+            bool haveLatestFiles = loadLatestPublishedKey(listYear, listMonth, listDay, latestFiles);
+            if (!haveLatestFiles && radarFeedUsesDatePartitionedListing(site)) {
+                shiftDate(listYear, listMonth, listDay, -1);
+                haveLatestFiles = loadLatestPublishedKey(listYear, listMonth, listDay, latestFiles);
+            }
+            if (haveLatestFiles) {
+                const std::string latestFileKey = latestFiles.back().key;
+                const int64_t latestFileEpoch = extractVolumeKeyEpoch(latestFileKey);
+                if (latestFileEpoch > 0 && latestChunkEpoch > 0 && latestFileEpoch > latestChunkEpoch) {
+                    fallbackToPublished();
+                    return;
+                }
+            }
+
             std::unordered_set<std::string> existingKeys;
             existingKeys.reserve(chunks.size());
 
@@ -3896,10 +4209,13 @@ void App::queueLiveChunkStationRefresh(int stationIdx, bool force) {
                     st.live_chunk = {};
                     st.live_chunk.volume_id = latestVolumeId;
                     st.live_chunk.volume_key = chunkVolumeDisplayKey(site, latestVolumeId, chunks);
+                    clearStationPreviewLocked(st);
                 }
 
-                for (const auto& key : st.live_chunk.chunk_keys)
-                    existingKeys.insert(key);
+                for (const auto& [sequence, record] : st.live_chunk.records) {
+                    (void)sequence;
+                    existingKeys.insert(record.key);
+                }
             }
 
             std::vector<NexradChunkFile> missingChunks;
@@ -3933,16 +4249,13 @@ void App::queueLiveChunkStationRefresh(int stationIdx, bool force) {
                     auto& st = m_stations[stationIdx];
                     if (st.live_chunk.volume_id != latestVolumeId)
                         return;
-                    st.live_chunk.chunk_keys.push_back(chunk.key);
-                    st.live_chunk.latest_chunk_key = chunk.key;
-                    st.live_chunk.saw_start = st.live_chunk.saw_start || chunk.part == 'S';
-                    st.live_chunk.saw_end = st.live_chunk.saw_end || chunk.part == 'E';
+                    st.live_chunk.records[chunk.sequence] = {chunk.key, std::move(chunkResult.data), chunk.part};
                     if (st.live_chunk.volume_key.empty())
                         st.live_chunk.volume_key = volumeKey;
-                    st.live_chunk.assembled_bytes.insert(st.live_chunk.assembled_bytes.end(),
-                                                         chunkResult.data.begin(), chunkResult.data.end());
+                    if (!rebuildLiveChunkContiguousPrefix(st.live_chunk))
+                        continue;
                     assembledSnapshot = st.live_chunk.assembled_bytes;
-                    finalChunk = st.live_chunk.saw_end;
+                    finalChunk = st.live_chunk.contiguous_saw_end;
                     volumeKey = st.live_chunk.volume_key;
                 }
 
@@ -4017,9 +4330,7 @@ void App::resetStationsForReload() {
         st.detection = {};
         st.live_history.clear();
         st.live_chunk = {};
-        st.preview_partial = false;
-        st.preview_sweep_count = 0;
-        st.preview_radial_count = 0;
+        clearStationPreviewLocked(st);
         st.uploaded_product = -1;
         st.uploaded_tilt = -1;
         st.uploaded_sweep = -1;
@@ -4158,7 +4469,7 @@ void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int
 
 bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
                              bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
-                             const std::string& volumeKey) {
+                             const std::string& volumeKey, bool suppressFastPreview) {
     if (!isCurrentDownloadGeneration(generation)) return false;
 
     PipelineStageTimings timings = {};
@@ -4193,7 +4504,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         !m_crossSection &&
         m_activeTilt == 0;
 
-    if (canPublishPartialRadialPreview) {
+    if (canPublishPartialRadialPreview && !suppressFastPreview) {
         auto previewParsed = Level2Parser::parseDecodedMessagesPreview(decoded, stationName, 1.5f, 64);
         const int previewLowestIdx = findLowestParsedSweepIndex(previewParsed);
         if (previewLowestIdx >= 0 && previewLowestIdx < (int)previewParsed.sweeps.size()) {
@@ -4208,6 +4519,10 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
                     if (!isCurrentDownloadGeneration(generation)) return false;
                     auto& st = m_stations[stationIdx];
                     if (st.enabled && countProductSweeps(previewSweeps, m_activeProduct) > 0) {
+                        st.preview_precomputed.clear();
+                        st.preview_data_lat = 0.0f;
+                        st.preview_data_lon = 0.0f;
+                        st.preview_volume_key.clear();
                         st.total_sweeps = std::max(1, (int)previewParsed.sweeps.size());
                         st.lowest_sweep_elev = previewSweeps.front().elevation_angle;
                         st.lowest_sweep_radials = previewSweeps.front().num_radials;
@@ -4276,6 +4591,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
             }
 
             const bool canPublishPreview =
+                !suppressFastPreview &&
                 stationIdx == m_activeStationIdx &&
                 !m_showAll &&
                 !m_mode3D &&
@@ -4288,6 +4604,10 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
                     if (!isCurrentDownloadGeneration(generation)) return false;
                     auto& st = m_stations[stationIdx];
                     if (st.enabled) {
+                        st.preview_precomputed.clear();
+                        st.preview_data_lat = 0.0f;
+                        st.preview_data_lon = 0.0f;
+                        st.preview_volume_key.clear();
                         st.total_sweeps = previewWorkingSet.total_sweeps > 0
                             ? previewWorkingSet.total_sweeps
                             : (int)previewWorkingSet.sweeps.size();
@@ -4420,9 +4740,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         st.error.clear();
         st.detection = std::move(detection);
         st.timings = timings;
-        st.preview_partial = false;
-        st.preview_sweep_count = 0;
-        st.preview_radial_count = 0;
+        clearStationPreviewLocked(st);
         if (!snapshotMode && !m_historicMode)
             appendLiveHistoryLocked(st, volumeKey, st.precomputed, detectionLat, detectionLon);
         if (st.downloading) {
@@ -4556,6 +4874,15 @@ std::vector<StationUiState> App::stations() const {
         ui.display_lat = baseLat - markerOffset.second / std::max(1.0, m_viewport.zoom);
         ui.display_lon = baseLon + markerOffset.first / std::max(1.0, m_viewport.zoom);
         ui.latest_scan_utc = formatVolumeKeyTimestamp(st.latestVolumeKey);
+        ui.last_full_scan_utc = ui.latest_scan_utc;
+        if (!st.preview_precomputed.empty()) {
+            const auto& previewSweep = st.preview_precomputed.front();
+            ui.partial_sweep_utc = formatEpochMsUtc(previewSweep.meta.sweep_display_epoch_ms);
+            if (ui.partial_sweep_utc.empty())
+                ui.partial_sweep_utc = formatVolumeKeyTimestamp(st.preview_volume_key);
+        } else {
+            ui.partial_sweep_utc.clear();
+        }
         ui.enabled = st.enabled;
         ui.pinned = pinnedCopy.find(st.index) != pinnedCopy.end();
         ui.priority_hot = ui.pinned ||
@@ -4788,20 +5115,29 @@ void App::refreshActiveTiltMetadata() {
     if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
     std::lock_guard<std::mutex> lock(m_stationMutex);
     const auto& st = m_stations[m_activeStationIdx];
-    if (st.precomputed.empty()) return;
+    const bool usePreview = shouldUseProvisionalPreviewLocked(
+        st, m_activeStationIdx, m_activeProduct, m_activeTilt, false);
+    const auto& sweeps = usePreview ? st.preview_precomputed : st.precomputed;
+    if (sweeps.empty()) return;
 
-    if (!st.full_volume_resident) {
-        m_maxTilts = std::max(1, st.total_sweeps);
-        m_activeTiltAngle = st.precomputed[0].elevation_angle;
+    if (usePreview) {
+        m_maxTilts = 1;
+        m_activeTiltAngle = sweeps.front().elevation_angle;
         return;
     }
 
-    int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    if (!st.full_volume_resident) {
+        m_maxTilts = std::max(1, st.total_sweeps);
+        m_activeTiltAngle = sweeps[0].elevation_angle;
+        return;
+    }
+
+    int productTilts = countProductSweeps(sweeps, m_activeProduct);
     if (productTilts <= 0) return;
     if (m_activeTilt >= productTilts) m_activeTilt = productTilts - 1;
     m_maxTilts = productTilts;
-    int sweepIdx = findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
-    m_activeTiltAngle = st.precomputed[sweepIdx].elevation_angle;
+    int sweepIdx = findProductSweep(sweeps, m_activeProduct, m_activeTilt);
+    m_activeTiltAngle = sweeps[sweepIdx].elevation_angle;
 }
 
 int App::currentAvailableTilts() {
@@ -4819,12 +5155,17 @@ int App::currentAvailableTilts() {
 
     std::lock_guard<std::mutex> lock(m_stationMutex);
     const auto& st = m_stations[m_activeStationIdx];
-    if (st.precomputed.empty())
+    const bool usePreview = shouldUseProvisionalPreviewLocked(
+        st, m_activeStationIdx, m_activeProduct, m_activeTilt, false);
+    const auto& sweeps = usePreview ? st.preview_precomputed : st.precomputed;
+    if (sweeps.empty())
         return std::max(1, m_maxTilts);
+    if (usePreview)
+        return 1;
     if (!st.full_volume_resident)
         return std::max(1, st.total_sweeps);
 
-    const int tilts = countProductSweeps(st.precomputed, m_activeProduct);
+    const int tilts = countProductSweeps(sweeps, m_activeProduct);
     return std::max(1, tilts);
 }
 
@@ -4848,10 +5189,13 @@ void App::uploadStation(int stationIdx) {
 
     std::lock_guard<std::mutex> lock(m_stationMutex);
     auto& st = m_stations[stationIdx];
-    if (st.precomputed.empty()) return;
+    const bool usePreview = shouldUseProvisionalPreviewLocked(
+        st, stationIdx, m_activeProduct, m_activeTilt, lowestSweepMosaic);
+    const auto& sweeps = usePreview ? st.preview_precomputed : st.precomputed;
+    if (sweeps.empty()) return;
 
     // Filter sweeps by active product - only show tilts that have this product
-    int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    int productTilts = countProductSweeps(sweeps, m_activeProduct);
     if (productTilts <= 0) {
         gpu::freeStation(stationIdx);
         st.gpuInfo = {};
@@ -4866,9 +5210,9 @@ void App::uploadStation(int stationIdx) {
     if (!lowestSweepMosaic && stationIdx == m_activeStationIdx)
         m_maxTilts = productTilts;
     int sweepIdx = lowestSweepMosaic
-        ? findProductSweep(st.precomputed, m_activeProduct, 0)
-        : findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
-    auto& pc = st.precomputed[sweepIdx];
+        ? findProductSweep(sweeps, m_activeProduct, 0)
+        : findProductSweep(sweeps, m_activeProduct, m_activeTilt);
+    auto& pc = sweeps[sweepIdx];
     if (pc.num_radials == 0) return;
 
     if (!lowestSweepMosaic && (stationIdx == m_activeStationIdx || m_activeStationIdx < 0))
@@ -4878,8 +5222,13 @@ void App::uploadStation(int stationIdx) {
     GpuStationInfo info = {};
     info.lat = st.lat;
     info.lon = st.lon;
-    if (st.data_lat != 0.0f) info.lat = st.data_lat;
-    if (st.data_lon != 0.0f) info.lon = st.data_lon;
+    if (usePreview) {
+        if (st.preview_data_lat != 0.0f) info.lat = st.preview_data_lat;
+        if (st.preview_data_lon != 0.0f) info.lon = st.preview_data_lon;
+    } else {
+        if (st.data_lat != 0.0f) info.lat = st.data_lat;
+        if (st.data_lon != 0.0f) info.lon = st.data_lon;
+    }
     info.elevation_angle = pc.elevation_angle;
     info.num_radials = pc.num_radials;
 
@@ -4917,7 +5266,7 @@ void App::uploadStation(int stationIdx) {
         int loaded = ++m_stationsLoaded;
         printf("GPU upload [%d/%d]: %s (%d radials, elev %.1f, %d sweeps)\n",
                loaded, m_stationsTotal, st.icao.c_str(),
-               info.num_radials, info.elevation_angle, (int)st.precomputed.size());
+               info.num_radials, info.elevation_angle, (int)sweeps.size());
     }
     m_gridDirty = true;
 }
@@ -5129,35 +5478,45 @@ bool App::ensurePanelCacheUpload(int paneIndex, int product, int tilt, float* ou
 
     std::lock_guard<std::mutex> lock(m_stationMutex);
     const auto& st = m_stations[m_activeStationIdx];
-    if (!st.enabled || st.precomputed.empty())
+    const bool usePreview = shouldUseProvisionalPreviewLocked(
+        st, m_activeStationIdx, product, tilt, false);
+    const auto& sweeps = usePreview ? st.preview_precomputed : st.precomputed;
+    if (!st.enabled || sweeps.empty())
         return false;
+    const std::string currentVolumeKey = usePreview && !st.preview_volume_key.empty()
+        ? st.preview_volume_key
+        : st.latestVolumeKey;
+    const float stationLat = usePreview && st.preview_data_lat != 0.0f ? st.preview_data_lat
+                                                                        : (st.data_lat != 0.0f ? st.data_lat : st.lat);
+    const float stationLon = usePreview && st.preview_data_lon != 0.0f ? st.preview_data_lon
+                                                                        : (st.data_lon != 0.0f ? st.data_lon : st.lon);
 
     const auto& cache = m_panelCacheStates[paneIndex];
     if (cache.valid && !cache.historic &&
         cache.station_idx == m_activeStationIdx &&
         cache.product == product &&
         cache.tilt == tilt &&
-        cache.volume_key == st.latestVolumeKey) {
+        cache.volume_key == currentVolumeKey) {
         if (outElevationAngle) {
-            const int productTilts = countProductSweeps(st.precomputed, product);
+            const int productTilts = countProductSweeps(sweeps, product);
             if (productTilts > 0) {
-                const int sweepIdx = findProductSweep(st.precomputed, product,
+                const int sweepIdx = findProductSweep(sweeps, product,
                                                       std::max(0, std::min(tilt, productTilts - 1)));
                 if (sweepIdx >= 0)
-                    *outElevationAngle = st.precomputed[sweepIdx].elevation_angle;
+                    *outElevationAngle = sweeps[sweepIdx].elevation_angle;
             }
         }
         return true;
     }
 
-    if (!uploadSweepSetToSlot(slot, st.precomputed,
-                              st.data_lat != 0.0f ? st.data_lat : st.lat,
-                              st.data_lon != 0.0f ? st.data_lon : st.lon,
+    if (!uploadSweepSetToSlot(slot, sweeps,
+                              stationLat,
+                              stationLon,
                               product, tilt, outElevationAngle)) {
         m_panelCacheStates[paneIndex] = {};
         return false;
     }
-    m_panelCacheStates[paneIndex] = {true, false, m_activeStationIdx, -1, product, tilt, st.latestVolumeKey};
+    m_panelCacheStates[paneIndex] = {true, false, m_activeStationIdx, -1, product, tilt, currentVolumeKey};
     return true;
 }
 
